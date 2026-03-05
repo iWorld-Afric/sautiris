@@ -1,6 +1,6 @@
 """SautiRIS — Open-source Radiology Information System."""
 
-__version__ = "1.0.0a1"
+__version__ = "1.0.0a2"
 
 from sautiris.app import create_ris_app
 from sautiris.config import SautiRISSettings
