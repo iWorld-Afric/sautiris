@@ -398,29 +398,33 @@ def upgrade() -> None:
     op.create_index("ix_ai_findings_tenant", "ai_findings", ["tenant_id"])
     op.create_index("ix_ai_findings_order", "ai_findings", ["order_id"])
 
-    # --- audit_logs ---
-    op.create_table(
-        "audit_logs",
-        sa.Column("id", sa.Uuid(), nullable=False),
-        sa.Column("tenant_id", sa.Uuid(), nullable=False),
-        sa.Column("user_id", sa.Uuid(), nullable=False),
-        sa.Column("user_name", sa.String(255), nullable=True),
-        sa.Column("action", sa.String(64), nullable=False),
-        sa.Column("resource_type", sa.String(64), nullable=False),
-        sa.Column("resource_id", sa.Uuid(), nullable=True),
-        sa.Column("patient_id", sa.Uuid(), nullable=True),
-        sa.Column("ip_address", sa.String(45), nullable=True),
-        sa.Column("user_agent", sa.String(512), nullable=True),
-        sa.Column("details", postgresql.JSONB(), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-        sa.PrimaryKeyConstraint("id"),
-    )
-    op.create_index("ix_audit_logs_tenant", "audit_logs", ["tenant_id"])
+    # --- audit_logs (skip if already exists, e.g. shared with host app) ---
+    from sqlalchemy import inspect as sa_inspect
+
+    bind = op.get_bind()
+    inspector = sa_inspect(bind)
+    if "audit_logs" not in inspector.get_table_names():
+        op.create_table(
+            "audit_logs",
+            sa.Column("id", sa.Uuid(), nullable=False),
+            sa.Column("tenant_id", sa.Uuid(), nullable=False),
+            sa.Column("user_id", sa.Uuid(), nullable=False),
+            sa.Column("user_name", sa.String(255), nullable=True),
+            sa.Column("action", sa.String(64), nullable=False),
+            sa.Column("resource_type", sa.String(64), nullable=False),
+            sa.Column("resource_id", sa.Uuid(), nullable=True),
+            sa.Column("patient_id", sa.Uuid(), nullable=True),
+            sa.Column("ip_address", sa.String(45), nullable=True),
+            sa.Column("user_agent", sa.String(512), nullable=True),
+            sa.Column("details", postgresql.JSONB(), nullable=True),
+            sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+            sa.PrimaryKeyConstraint("id"),
+        )
+        op.create_index("ix_audit_logs_tenant", "audit_logs", ["tenant_id"])
 
 
 def downgrade() -> None:
     tables = [
-        "audit_logs",
         "ai_findings",
         "ai_provider_configs",
         "pacs_connections",

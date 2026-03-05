@@ -19,6 +19,7 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
+version_table = config.get_main_option("version_table", "alembic_version_ris")
 
 
 def run_migrations_offline() -> None:
@@ -29,13 +30,18 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        version_table=version_table,
     )
     with context.begin_transaction():
         context.run_migrations()
 
 
 def do_run_migrations(connection: object) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata)  # type: ignore[arg-type]
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        version_table=version_table,
+    )  # type: ignore[arg-type]
     with context.begin_transaction():
         context.run_migrations()
 
