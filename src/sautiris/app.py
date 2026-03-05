@@ -19,11 +19,20 @@ from sautiris.core.tenancy import TenantMiddleware
 
 def create_ris_app(
     settings: SautiRISSettings | None = None,
+    *,
+    api_prefix: str | None = None,
     **overrides: Any,
 ) -> FastAPI:
     """Create and configure the SautiRIS FastAPI application.
 
     Can be used standalone or mounted into another FastAPI app.
+
+    Args:
+        settings: Pre-built settings object.  Falls back to env + *overrides*.
+        api_prefix: Override the internal API prefix.  Pass ``""`` when mounting
+            as a sub-application so routes don't double-prefix.  Defaults to
+            ``"/api/v1"`` for standalone usage.
+        **overrides: Keyword arguments forwarded to ``SautiRISSettings``.
     """
     if settings is None:
         settings = SautiRISSettings(**overrides)
@@ -82,7 +91,9 @@ def create_ris_app(
         jwt_claim=settings.tenant_jwt_claim,
     )
 
-    # Routers
-    app.include_router(api_router)
+    # Routers — default prefix is /api/v1 for standalone; pass api_prefix=""
+    # when mounting as a sub-app to avoid double-prefixing.
+    _prefix = "/api/v1" if api_prefix is None else api_prefix
+    app.include_router(api_router, prefix=_prefix)
 
     return app

@@ -17,7 +17,7 @@ from sautiris.api.v1 import (
     worklist,
 )
 
-api_router = APIRouter(prefix="/api/v1")
+api_router = APIRouter()
 api_router.include_router(health.router)
 api_router.include_router(orders.router)
 api_router.include_router(schedule.router)
