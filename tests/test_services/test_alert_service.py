@@ -1,0 +1,193 @@
+"""Tests for AlertService."""
+
+from __future__ import annotations
+
+import uuid
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from sautiris.models.alert import AlertType, AlertUrgency, CriticalAlert, NotificationMethod
+from sautiris.services.alert_service import AlertService
+from tests.conftest import TEST_USER_ID, make_order
+
+
+@pytest.fixture
+async def order(db_session: AsyncSession) -> CriticalAlert:
+    """Create a test order."""
+    order = make_order(db_session)
+    db_session.add(order)
+    await db_session.flush()
+    await db_session.refresh(order)
+    return order
+
+
+@pytest.fixture
+def alert_service(db_session: AsyncSession) -> AlertService:
+    return AlertService(db_session, escalation_timeout_minutes=30)
+
+
+class TestCreateAlert:
+    async def test_create_alert_basic(
+        self, alert_service: AlertService, order: object, db_session: AsyncSession
+    ) -> None:
+        alert = await alert_service.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.CRITICAL_FINDING,
+            finding_description="Pneumothorax detected",
+            urgency=AlertUrgency.IMMEDIATE,
+        )
+        assert alert.id is not None
+        assert alert.order_id == order.id  # type: ignore[union-attr]
+        assert alert.alert_type == AlertType.CRITICAL_FINDING
+        assert alert.finding_description == "Pneumothorax detected"
+        assert alert.urgency == AlertUrgency.IMMEDIATE
+        assert alert.notified_at is not None
+        assert alert.acknowledged_at is None
+        assert alert.escalated is False
+
+    async def test_create_alert_with_physician(
+        self, alert_service: AlertService, order: object
+    ) -> None:
+        physician_id = uuid.uuid4()
+        alert = await alert_service.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.UNEXPECTED_FINDING,
+            notified_physician_id=physician_id,
+            notified_physician_name="Dr. Kamau",
+            notification_method=NotificationMethod.SMS,
+        )
+        assert alert.notified_physician_id == physician_id
+        assert alert.notified_physician_name == "Dr. Kamau"
+        assert alert.notification_method == NotificationMethod.SMS
+
+
+class TestAcknowledgeAlert:
+    async def test_acknowledge_alert(self, alert_service: AlertService, order: object) -> None:
+        alert = await alert_service.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.CRITICAL_FINDING,
+        )
+        acked = await alert_service.acknowledge_alert(alert.id, user_id=TEST_USER_ID)
+        assert acked.acknowledged_at is not None
+        assert acked.acknowledged_by == TEST_USER_ID
+
+    async def test_acknowledge_nonexistent(self, alert_service: AlertService) -> None:
+        with pytest.raises(ValueError, match="not found"):
+            await alert_service.acknowledge_alert(uuid.uuid4(), user_id=TEST_USER_ID)
+
+    async def test_acknowledge_twice(self, alert_service: AlertService, order: object) -> None:
+        alert = await alert_service.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.CRITICAL_FINDING,
+        )
+        await alert_service.acknowledge_alert(alert.id, user_id=TEST_USER_ID)
+        with pytest.raises(ValueError, match="already acknowledged"):
+            await alert_service.acknowledge_alert(alert.id, user_id=TEST_USER_ID)
+
+
+class TestEscalateAlert:
+    async def test_escalate_alert(self, alert_service: AlertService, order: object) -> None:
+        alert = await alert_service.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.CRITICAL_FINDING,
+        )
+        escalated = await alert_service.escalate_alert(alert.id)
+        assert escalated.escalated is True
+        assert escalated.escalated_at is not None
+
+    async def test_escalate_nonexistent(self, alert_service: AlertService) -> None:
+        with pytest.raises(ValueError, match="not found"):
+            await alert_service.escalate_alert(uuid.uuid4())
+
+    async def test_escalate_twice(self, alert_service: AlertService, order: object) -> None:
+        alert = await alert_service.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.CRITICAL_FINDING,
+        )
+        await alert_service.escalate_alert(alert.id)
+        with pytest.raises(ValueError, match="already escalated"):
+            await alert_service.escalate_alert(alert.id)
+
+
+class TestListAlerts:
+    async def test_list_all(self, alert_service: AlertService, order: object) -> None:
+        await alert_service.create_alert(
+            order_id=order.id,
+            alert_type=AlertType.CRITICAL_FINDING,  # type: ignore[union-attr]
+        )
+        await alert_service.create_alert(
+            order_id=order.id,
+            alert_type=AlertType.INCIDENTAL,  # type: ignore[union-attr]
+        )
+        alerts = await alert_service.list_alerts()
+        assert len(alerts) == 2
+
+    async def test_list_by_urgency(self, alert_service: AlertService, order: object) -> None:
+        await alert_service.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.CRITICAL_FINDING,
+            urgency=AlertUrgency.IMMEDIATE,
+        )
+        await alert_service.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.INCIDENTAL,
+            urgency=AlertUrgency.NON_URGENT,
+        )
+        immediate = await alert_service.list_alerts(urgency=AlertUrgency.IMMEDIATE)
+        assert len(immediate) == 1
+        assert immediate[0].urgency == AlertUrgency.IMMEDIATE
+
+
+class TestAlertStats:
+    async def test_stats_empty(self, alert_service: AlertService) -> None:
+        stats = await alert_service.get_stats()
+        assert stats["total"] == 0
+        assert stats["pending"] == 0
+        assert stats["escalation_rate"] == 0.0
+
+    async def test_stats_with_data(self, alert_service: AlertService, order: object) -> None:
+        alert1 = await alert_service.create_alert(
+            order_id=order.id,
+            alert_type=AlertType.CRITICAL_FINDING,  # type: ignore[union-attr]
+        )
+        await alert_service.create_alert(
+            order_id=order.id,
+            alert_type=AlertType.UNEXPECTED_FINDING,  # type: ignore[union-attr]
+        )
+        await alert_service.acknowledge_alert(alert1.id, user_id=TEST_USER_ID)
+
+        stats = await alert_service.get_stats()
+        assert stats["total"] == 2
+        assert stats["acknowledged"] == 1
+        assert stats["pending"] >= 0
+
+
+class TestAutoEscalation:
+    async def test_check_escalation_no_stale(
+        self, alert_service: AlertService, order: object
+    ) -> None:
+        await alert_service.create_alert(
+            order_id=order.id,
+            alert_type=AlertType.CRITICAL_FINDING,  # type: ignore[union-attr]
+        )
+        # Just created, not stale yet
+        escalated = await alert_service.check_escalation()
+        assert len(escalated) == 0
+
+    async def test_check_escalation_with_stale(
+        self, alert_service: AlertService, order: object, db_session: AsyncSession
+    ) -> None:
+        alert = await alert_service.create_alert(
+            order_id=order.id,
+            alert_type=AlertType.CRITICAL_FINDING,  # type: ignore[union-attr]
+        )
+        # Manually backdate the created_at to simulate a stale alert
+        alert.created_at = datetime.now(UTC) - timedelta(minutes=60)  # type: ignore[assignment]
+        await db_session.flush()
+
+        svc = AlertService(db_session, escalation_timeout_minutes=30)
+        escalated = await svc.check_escalation()
+        assert len(escalated) == 1
+        assert escalated[0].escalated is True
