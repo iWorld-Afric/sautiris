@@ -402,3 +402,36 @@ class TestAlertServiceEventBus:
             alert_type=AlertType.CRITICAL_FINDING,
         )
         assert alert.id is not None
+
+
+# ---------------------------------------------------------------------------
+# check_escalation commit failure — returns [] on failure
+# ---------------------------------------------------------------------------
+
+
+class TestCheckEscalationCommitFailure:
+    async def test_check_escalation_returns_empty_on_commit_failure(
+        self, db_session: AsyncSession, order: object
+    ) -> None:
+        """check_escalation returns [] when session.commit() fails.
+
+        The escalated records were not persisted, so returning them would
+        mislead the caller into thinking they were saved.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        svc = AlertService(db_session, escalation_timeout_minutes=30)
+        alert = await svc.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.CRITICAL_FINDING,
+        )
+        # Backdate to exceed the 30-minute escalation timeout
+        alert.created_at = datetime.now(UTC) - timedelta(minutes=60)  # type: ignore[assignment]
+        await db_session.flush()
+
+        with patch.object(db_session, "commit", new_callable=AsyncMock) as mock_commit:
+            mock_commit.side_effect = RuntimeError("DB went away")
+            escalated = await svc.check_escalation()
+
+        # Must return empty list since commit failed — records not persisted
+        assert escalated == []

@@ -21,7 +21,11 @@ import structlog
 from pydicom.dataset import Dataset
 from pynetdicom import AE, evt
 
-from sautiris.integrations.dicom.constants import CHARSET_UTF8, DEFAULT_TRANSFER_SYNTAXES
+from sautiris.integrations.dicom.constants import (
+    CHARSET_UTF8,
+    DEFAULT_TRANSFER_SYNTAXES,
+    build_dicom_ssl_context,
+)
 from sautiris.models.mpps import MPPSStatusEnum
 
 if TYPE_CHECKING:
@@ -246,6 +250,10 @@ class MPPSServer:
 
         mpps_data = extract_mpps_data(attr_list)
         if not self._invoke_callback(sop_instance_uid, mpps_data):
+            # Rollback in-memory state: instance was not persisted to DB,
+            # so keeping it in _instances would create an inconsistent state
+            # where N-SET could succeed against a phantom instance.
+            self._instances.pop(sop_instance_uid, None)
             return 0xC001, None
 
         response = _make_mpps_response(Dataset())
@@ -319,10 +327,12 @@ class MPPSServer:
                 return 0x0110, None
 
         # Build working copy; mutate _instances only after successful callback
-        # to prevent irrecoverable state if callback fails (HIGH-4 fix)
+        # to prevent irrecoverable state if callback fails (HIGH-4 fix).
+        # Must use deepcopy: pydicom Dataset shallow copy shares DataElement
+        # references, so add() on the working copy can mutate stored.
 
         stored = self._instances[sop_instance_uid]
-        working = copy.copy(stored)
+        working = copy.deepcopy(stored)
         for elem in mod_list:
             working.add(elem)
 
@@ -355,21 +365,8 @@ class MPPSServer:
         return True
 
     def _build_ssl_context(self) -> ssl.SSLContext | None:
-        """Build an SSL context from TLS cert/key/CA parameters.
-
-        Returns None if TLS is not configured (no cert+key provided).
-        """
-        if not (self._tls_cert and self._tls_key):
-            return None
-        import ssl
-
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-        ctx.load_cert_chain(certfile=self._tls_cert, keyfile=self._tls_key)
-        if self._tls_ca_cert:
-            ctx.load_verify_locations(cafile=self._tls_ca_cert)
-            ctx.verify_mode = ssl.CERT_REQUIRED
-        return ctx
+        """Build an SSL context from TLS cert/key/CA parameters."""
+        return build_dicom_ssl_context(self._tls_cert, self._tls_key, self._tls_ca_cert)
 
     def preload_active_instances(self, instances: dict[str, Dataset]) -> None:
         """Preload active MPPS instances from the database on startup.
@@ -406,6 +403,13 @@ class MPPSServer:
             )
 
         ssl_context = self._build_ssl_context()
+        if ssl_context is None:
+            logger.warning(
+                "mpps.tls_disabled",
+                ae_title=self.ae_title,
+                port=self.port,
+                msg="MPPS SCP starting without TLS — DICOM traffic is unencrypted",
+            )
         self._ae.start_server(
             (self._bind_address, self.port),
             block=False,

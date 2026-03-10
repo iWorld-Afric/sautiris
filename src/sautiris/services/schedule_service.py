@@ -56,7 +56,7 @@ class ScheduleService:
             errors = await self._event_bus.publish(event)
             if errors:
                 for exc in errors:
-                    logger.warning(
+                    logger.error(
                         "event_bus.handler_error",
                         event_type=event.event_type,
                         error=str(exc),

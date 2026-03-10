@@ -114,6 +114,16 @@ _ENCRYPTED_COLUMNS: tuple[tuple[str, list[str]], ...] = (
 )
 
 
+class KeyRotationResult:
+    """Result of a key rotation operation."""
+
+    __slots__ = ("rotated_count", "skipped_count")
+
+    def __init__(self, rotated_count: int, skipped_count: int) -> None:
+        self.rotated_count = rotated_count
+        self.skipped_count = skipped_count
+
+
 def rotate_encryption_key(
     conn: Connection,
     old_key: str,
@@ -126,12 +136,31 @@ def rotate_encryption_key(
 
     Returns the number of values re-encrypted.
     """
+    result = rotate_encryption_key_detailed(conn, old_key, new_key)
+    return result.rotated_count
+
+
+def rotate_encryption_key_detailed(
+    conn: Connection,
+    old_key: str,
+    new_key: str,
+) -> KeyRotationResult:
+    """Re-encrypt all credential columns from *old_key* to *new_key*.
+
+    Operates within the caller's transaction — the caller is responsible
+    for committing or rolling back.
+
+    Returns a ``KeyRotationResult`` with both rotated and skipped counts.
+    Logs a WARNING for each skipped plaintext value and raises
+    ``DecryptionError`` with context if decryption fails on a Fernet token.
+    """
     from cryptography.fernet import Fernet  # noqa: PLC0415
     from sqlalchemy import text  # noqa: PLC0415
 
     old_fernet = Fernet(old_key.encode())
     new_fernet = Fernet(new_key.encode())
     rotated = 0
+    skipped = 0
 
     for table, columns in _ENCRYPTED_COLUMNS:
         col_list = ", ".join(["id", *columns])
@@ -141,9 +170,27 @@ def rotate_encryption_key(
             updates: dict[str, str] = {}
             for i, col in enumerate(columns, start=1):
                 value = row[i]
-                if value and str(value).startswith(_FERNET_PREFIX):
-                    plaintext = old_fernet.decrypt(str(value).encode()).decode()
-                    updates[col] = new_fernet.encrypt(plaintext.encode()).decode()
+                if not value:
+                    continue
+                str_value = str(value)
+                if not str_value.startswith(_FERNET_PREFIX):
+                    skipped += 1
+                    logger.warning(
+                        "crypto.key_rotation_skipped_plaintext",
+                        table=table,
+                        column=col,
+                        row_id=str(row_id),
+                        msg="Value is not Fernet-encrypted — skipping rotation",
+                    )
+                    continue
+                try:
+                    plaintext = old_fernet.decrypt(str_value.encode()).decode()
+                except InvalidToken:
+                    raise DecryptionError(
+                        f"Failed to decrypt {table}.{col} (row {row_id}) "
+                        f"with the old key — wrong key or corrupted ciphertext"
+                    ) from None
+                updates[col] = new_fernet.encrypt(plaintext.encode()).decode()
             if updates:
                 rotated += len(updates)
                 set_clause = ", ".join(f"{k} = :{k}" for k in updates)
@@ -153,5 +200,9 @@ def rotate_encryption_key(
                     updates,
                 )
 
-    logger.info("crypto.key_rotation_complete", rotated_values=rotated)
-    return rotated
+    logger.info(
+        "crypto.key_rotation_complete",
+        rotated_values=rotated,
+        skipped_plaintext=skipped,
+    )
+    return KeyRotationResult(rotated_count=rotated, skipped_count=skipped)

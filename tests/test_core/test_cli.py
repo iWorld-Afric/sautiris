@@ -49,3 +49,35 @@ class TestCLI:
         assert result.exit_code == 0
         assert "--port" in result.output
         assert "--ae-title" in result.output
+
+    def test_rotate_key_help(self) -> None:
+        runner = CliRunner()
+        result = runner.invoke(main, ["security", "rotate-key", "--help"])
+        assert result.exit_code == 0
+        assert "--old-key" in result.output
+        assert "--new-key" in result.output
+        assert "--database-url" in result.output
+
+    def test_rotate_key_reads_keys_from_envvars(self) -> None:
+        """rotate-key accepts --old-key and --new-key via environment variables."""
+        from cryptography.fernet import Fernet
+
+        old_key = Fernet.generate_key().decode()
+        new_key = Fernet.generate_key().decode()
+        runner = CliRunner()
+        # Pass keys via envvar only (no --old-key / --new-key flags).
+        # Without a database URL the command will fail at DB connect, but we
+        # verify the key validation step succeeds (no "Missing option" error).
+        result = runner.invoke(
+            main,
+            ["security", "rotate-key"],
+            env={
+                "SAUTIRIS_OLD_ENCRYPTION_KEY": old_key,
+                "SAUTIRIS_NEW_ENCRYPTION_KEY": new_key,
+                "SAUTIRIS_DATABASE_URL": "sqlite:///nonexistent.db",
+            },
+        )
+        # Should NOT fail with "Missing option --old-key" or "--new-key"
+        assert "Missing option" not in (result.output or "")
+        assert "--old-key" not in (result.output or "")
+        assert "--new-key" not in (result.output or "")

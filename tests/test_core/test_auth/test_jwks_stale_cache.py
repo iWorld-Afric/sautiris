@@ -40,8 +40,8 @@ def _prime_cache(provider: KeycloakAuthProvider | OAuth2AuthProvider) -> dict[st
     """Pre-populate the cache with stale data (expired TTL)."""
     stale_jwks = {"keys": [{"kid": "stale-key", "kty": "RSA"}]}
     provider._jwks_cache = stale_jwks
-    # Set cache_time far in the past so TTL has expired
-    provider._cache_time = time.monotonic() - 99999
+    # Set cache_time in the past so TTL has expired, but within MAX_STALE_AGE (86400s)
+    provider._cache_time = time.monotonic() - 3600  # 1 hour ago
     return stale_jwks
 
 

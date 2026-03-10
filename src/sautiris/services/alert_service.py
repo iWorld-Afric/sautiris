@@ -320,6 +320,7 @@ class AlertService:
                     exc_info=True,
                     msg="Failed to persist auto-escalation records — manual follow-up required",
                 )
+                return []
             logger.warning(
                 "auto_escalation_completed",
                 escalated_count=len(escalated),

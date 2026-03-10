@@ -57,8 +57,18 @@ def security() -> None:
 
 
 @security.command("rotate-key")
-@click.option("--old-key", required=True, help="Current Fernet encryption key (base64)")
-@click.option("--new-key", required=True, help="New Fernet encryption key (base64)")
+@click.option(
+    "--old-key",
+    required=True,
+    envvar="SAUTIRIS_OLD_ENCRYPTION_KEY",
+    help="Current Fernet encryption key (base64)",
+)
+@click.option(
+    "--new-key",
+    required=True,
+    envvar="SAUTIRIS_NEW_ENCRYPTION_KEY",
+    help="New Fernet encryption key (base64)",
+)
 @click.option("--database-url", envvar="SAUTIRIS_DATABASE_URL", required=True, help="Database URL")
 def rotate_key(old_key: str, new_key: str, database_url: str) -> None:
     """Rotate the Fernet encryption key for all stored credentials.
@@ -69,7 +79,7 @@ def rotate_key(old_key: str, new_key: str, database_url: str) -> None:
     from cryptography.fernet import Fernet  # noqa: PLC0415
     from sqlalchemy import create_engine  # noqa: PLC0415
 
-    from sautiris.core.crypto import rotate_encryption_key  # noqa: PLC0415
+    from sautiris.core.crypto import rotate_encryption_key_detailed  # noqa: PLC0415
 
     # Validate keys before touching the database
     for label, key in [("old-key", old_key), ("new-key", new_key)]:
@@ -80,10 +90,12 @@ def rotate_key(old_key: str, new_key: str, database_url: str) -> None:
 
     engine = create_engine(database_url)
     with engine.begin() as conn:
-        count = rotate_encryption_key(conn, old_key, new_key)
+        result = rotate_encryption_key_detailed(conn, old_key, new_key)
     engine.dispose()
 
-    click.echo(f"Key rotation complete: {count} value(s) re-encrypted.")
+    click.echo(f"Key rotation complete: {result.rotated_count} value(s) re-encrypted.")
+    if result.skipped_count:
+        click.echo(f"Warning: {result.skipped_count} plaintext value(s) skipped (not encrypted).")
     click.echo("Update SAUTIRIS_ENCRYPTION_KEY to the new key before restarting the app.")
 
 

@@ -465,6 +465,47 @@ class TestPatientNameWildcardFilters:
         assert filters["patient_name_pattern"] == "%"
 
 
+class TestSQLLIKEMetacharacterEscaping:
+    """R2-H3: SQL LIKE metacharacters (% and _) must be escaped before wildcard conversion."""
+
+    def test_literal_percent_escaped_in_wildcard_query(self) -> None:
+        """Patient name '100%*' should escape % before converting * to %."""
+        ds = Dataset()
+        ds.PatientName = "100%*"
+        filters = extract_query_filters(ds)
+        assert filters["patient_name_pattern"] == r"100\%%"
+
+    def test_literal_underscore_escaped_in_wildcard_query(self) -> None:
+        """Patient name 'DOE_J*' should escape _ before converting * to %."""
+        ds = Dataset()
+        ds.PatientName = "DOE_J*"
+        filters = extract_query_filters(ds)
+        assert filters["patient_name_pattern"] == r"DOE\_J%"
+
+    def test_both_metacharacters_escaped(self) -> None:
+        """Both % and _ literals are escaped in wildcard queries."""
+        ds = Dataset()
+        ds.PatientName = "100%_TEST*"
+        filters = extract_query_filters(ds)
+        assert filters["patient_name_pattern"] == r"100\%\_TEST%"
+
+    def test_no_metacharacters_no_change(self) -> None:
+        """Normal wildcard query without SQL metacharacters is unchanged."""
+        ds = Dataset()
+        ds.PatientName = "DOE*"
+        filters = extract_query_filters(ds)
+        assert filters["patient_name_pattern"] == "DOE%"
+
+    def test_exact_match_with_percent_not_escaped(self) -> None:
+        """Exact match (no DICOM wildcards) doesn't touch SQL metacharacters."""
+        ds = Dataset()
+        ds.PatientName = "100% Smith"
+        filters = extract_query_filters(ds)
+        # No wildcards → exact match path, not LIKE pattern
+        assert filters["patient_name"] == "100% Smith"
+        assert "patient_name_pattern" not in filters
+
+
 # ---------------------------------------------------------------------------
 # GAP-2: _handle_find callback exception path
 # ---------------------------------------------------------------------------
@@ -635,3 +676,44 @@ class TestStudyInstanceUIDPersistence:
         ds = worklist_item_to_dataset(item)
         uid = str(ds.StudyInstanceUID)
         assert uid and uid != ""  # should be a generated UID, not empty
+
+
+# ---------------------------------------------------------------------------
+# R2-H4: Shared build_dicom_ssl_context tests
+# ---------------------------------------------------------------------------
+
+
+class TestBuildDicomSSLContext:
+    """R2-H4: Shared build_dicom_ssl_context utility in constants.py."""
+
+    def test_returns_none_when_no_cert(self) -> None:
+        from sautiris.integrations.dicom.constants import build_dicom_ssl_context
+
+        result = build_dicom_ssl_context("", "", "")
+        assert result is None
+
+    def test_returns_none_when_no_key(self) -> None:
+        from sautiris.integrations.dicom.constants import build_dicom_ssl_context
+
+        result = build_dicom_ssl_context("/path/to/cert.pem", "", "")
+        assert result is None
+
+    def test_returns_none_when_both_empty(self) -> None:
+        from sautiris.integrations.dicom.constants import build_dicom_ssl_context
+
+        result = build_dicom_ssl_context("", "/path/to/key.pem", "")
+        assert result is None
+
+    def test_all_three_scp_classes_delegate_to_shared_helper(self) -> None:
+        """All 3 SCP _build_ssl_context methods delegate to the shared function."""
+        from sautiris.integrations.dicom.mpps_scp import MPPSServer
+        from sautiris.integrations.dicom.store_scp import StoreSCPServer
+
+        # Without TLS config, all return None (via shared helper)
+        mpps = MPPSServer()
+        mwl = MWLServer()
+        store = StoreSCPServer()
+
+        assert mpps._build_ssl_context() is None
+        assert mwl._build_ssl_context() is None
+        assert store._build_ssl_context() is None

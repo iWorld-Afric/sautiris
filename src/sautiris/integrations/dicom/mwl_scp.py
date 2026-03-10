@@ -16,7 +16,11 @@ from pydicom.dataset import Dataset
 from pydicom.uid import generate_uid
 from pynetdicom import AE, evt
 
-from sautiris.integrations.dicom.constants import CHARSET_UTF8, DEFAULT_TRANSFER_SYNTAXES
+from sautiris.integrations.dicom.constants import (
+    CHARSET_UTF8,
+    DEFAULT_TRANSFER_SYNTAXES,
+    build_dicom_ssl_context,
+)
 
 if TYPE_CHECKING:
     import ssl  # noqa: F401
@@ -156,8 +160,10 @@ def extract_query_filters(identifier: Dataset) -> dict[str, Any]:
     if patient_name and str(patient_name).strip():
         name_str = str(patient_name).strip()
         if "*" in name_str or "?" in name_str:
-            # DICOM wildcard query (PS3.4 C.2.2.2.4) — convert to SQL LIKE pattern
-            like_pattern = name_str.replace("*", "%").replace("?", "_")
+            # DICOM wildcard query (PS3.4 C.2.2.2.4) — convert to SQL LIKE pattern.
+            # Escape SQL LIKE metacharacters first, then convert DICOM wildcards.
+            escaped = name_str.replace("%", r"\%").replace("_", r"\_")
+            like_pattern = escaped.replace("*", "%").replace("?", "_")
             filters["patient_name_pattern"] = like_pattern
         else:
             filters["patient_name"] = name_str
@@ -275,21 +281,8 @@ class MWLServer:
                 )
 
     def _build_ssl_context(self) -> ssl.SSLContext | None:
-        """Build an SSL context from TLS cert/key/CA parameters.
-
-        Returns None if TLS is not configured (no cert+key provided).
-        """
-        if not (self._tls_cert and self._tls_key):
-            return None
-        import ssl
-
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-        ctx.load_cert_chain(certfile=self._tls_cert, keyfile=self._tls_key)
-        if self._tls_ca_cert:
-            ctx.load_verify_locations(cafile=self._tls_ca_cert)
-            ctx.verify_mode = ssl.CERT_REQUIRED
-        return ctx
+        """Build an SSL context from TLS cert/key/CA parameters."""
+        return build_dicom_ssl_context(self._tls_cert, self._tls_key, self._tls_ca_cert)
 
     def start(self) -> None:
         """Start the MWL SCP in non-blocking mode."""
@@ -312,6 +305,13 @@ class MWLServer:
             )
 
         ssl_context = self._build_ssl_context()
+        if ssl_context is None:
+            logger.warning(
+                "mwl.tls_disabled",
+                ae_title=self.ae_title,
+                port=self.port,
+                msg="MWL SCP starting without TLS — DICOM traffic is unencrypted",
+            )
         self._ae.start_server(
             (self._bind_address, self.port),
             block=False,

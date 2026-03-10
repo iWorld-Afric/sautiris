@@ -32,6 +32,44 @@ async def test_create_worklist_item(worklist_service: WorklistService) -> None:
     assert item.status == WorklistStatus.SCHEDULED
 
 
+async def test_create_item_generates_study_instance_uid(
+    worklist_service: WorklistService,
+) -> None:
+    """Newly created WorklistItem has a valid DICOM study_instance_uid populated."""
+    item = await worklist_service.create_worklist_item(
+        order_id=uuid.uuid4(),
+        accession_number="ACC-UID-001",
+        patient_id="PAT-UID-001",
+        patient_name="DOE^UID",
+        modality="CT",
+    )
+    assert item.study_instance_uid is not None
+    assert len(item.study_instance_uid) > 0
+    # Valid DICOM UID format contains dots
+    assert "." in item.study_instance_uid
+
+
+async def test_create_items_have_unique_study_instance_uids(
+    worklist_service: WorklistService,
+) -> None:
+    """Each WorklistItem gets a distinct study_instance_uid."""
+    item1 = await worklist_service.create_worklist_item(
+        order_id=uuid.uuid4(),
+        accession_number="ACC-UID-002",
+        patient_id="PAT-UID-002",
+        patient_name="DOE^UNIQUE1",
+        modality="CT",
+    )
+    item2 = await worklist_service.create_worklist_item(
+        order_id=uuid.uuid4(),
+        accession_number="ACC-UID-003",
+        patient_id="PAT-UID-003",
+        patient_name="DOE^UNIQUE2",
+        modality="MR",
+    )
+    assert item1.study_instance_uid != item2.study_instance_uid
+
+
 async def test_get_item(worklist_service: WorklistService) -> None:
     item = await worklist_service.create_worklist_item(
         order_id=uuid.uuid4(),
@@ -146,13 +184,13 @@ async def test_worklist_publish_handler_error_is_logged(db_session: AsyncSession
         mock_logger.error.assert_called()
 
 
-async def test_worklist_exam_completed_handler_failure_logs_secondary_error(
+async def test_worklist_exam_completed_handler_failure_logs_critical(
     db_session: AsyncSession,
 ) -> None:
-    """ExamCompleted handler failure triggers an additional error about workflow impact.
+    """ExamCompleted handler failure triggers logger.critical for workflow impact.
 
     WorklistService._publish checks isinstance(event, ExamCompleted) and emits
-    a second logger.error with 'exam_completed_handlers_failed' to signal that
+    logger.critical with 'exam_completed_handlers_failed' to signal that
     a workflow-critical event was not delivered.
     """
     from unittest.mock import patch
@@ -179,11 +217,12 @@ async def test_worklist_exam_completed_handler_failure_logs_secondary_error(
 
     with patch("sautiris.services.worklist_service.logger") as mock_logger:
         await svc.update_procedure_step_status(item.id, WorklistStatus.COMPLETED)
-        # Must call logger.error (at least once for handler error, once for exam_completed msg)
-        error_calls = mock_logger.error.call_args_list
-        assert len(error_calls) >= 1
-        all_error_args = " ".join(str(c.args) for c in error_calls)
-        assert "event_bus" in all_error_args or "exam_completed" in all_error_args
+        # logger.error called for each handler error
+        mock_logger.error.assert_called()
+        # logger.critical called for ExamCompleted workflow-critical escalation
+        mock_logger.critical.assert_called()
+        critical_key = mock_logger.critical.call_args[0][0]
+        assert "exam_completed_handlers_failed" in critical_key
 
 
 async def test_worklist_publish_no_error_does_not_log_error(

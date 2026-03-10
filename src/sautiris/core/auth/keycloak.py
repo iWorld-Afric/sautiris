@@ -17,6 +17,10 @@ from sautiris.core.auth.base import AuthProvider, AuthUser
 
 logger = structlog.get_logger(__name__)
 
+# Maximum age (seconds) before a stale JWKS cache is considered too old to trust.
+# After this duration, a fresh fetch failure raises 503 instead of returning stale keys.
+MAX_STALE_AGE: int = 86_400  # 24 hours
+
 
 class KeycloakAuthProvider(AuthProvider):
     """Keycloak OIDC token verification via JWKS with TTL cache and key-miss refetch."""
@@ -91,11 +95,13 @@ class KeycloakAuthProvider(AuthProvider):
             except httpx.HTTPError as exc:
                 logger.error("jwks.fetch_failed", url=self.jwks_url, error=str(exc))
                 # SEC-2: Return stale cache if available — only raise 503 on cold start
-                if self._jwks_cache is not None:
+                # or if the cache is older than MAX_STALE_AGE
+                cache_age = now - self._cache_time
+                if self._jwks_cache is not None and cache_age < MAX_STALE_AGE:
                     logger.warning(
                         "jwks.using_stale_cache",
                         url=self.jwks_url,
-                        cache_age_seconds=round(now - self._cache_time, 1),
+                        cache_age_seconds=round(cache_age, 1),
                     )
                     return self._jwks_cache
                 raise HTTPException(
@@ -174,11 +180,27 @@ class KeycloakAuthProvider(AuthProvider):
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Token missing required tenant_id claim",
             )
+        try:
+            user_id = uuid.UUID(payload["sub"])
+        except (ValueError, KeyError):
+            logger.warning("auth.invalid_sub_claim", sub=payload.get("sub"))
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token contains invalid sub claim",
+            ) from None
+        try:
+            tenant_uuid = uuid.UUID(str(tenant_id_raw))
+        except ValueError:
+            logger.warning("auth.invalid_tenant_id_claim", tenant_id=str(tenant_id_raw))
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token contains invalid tenant_id claim",
+            ) from None
         return AuthUser(
-            user_id=uuid.UUID(payload["sub"]),
+            user_id=user_id,
             username=payload.get("preferred_username", ""),
             email=payload.get("email", ""),
-            tenant_id=uuid.UUID(str(tenant_id_raw)),
+            tenant_id=tenant_uuid,
             roles=tuple(roles),
             permissions=tuple(payload.get("permissions", [])),
             name=payload.get("name", ""),

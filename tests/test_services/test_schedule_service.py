@@ -195,13 +195,13 @@ async def test_list_rooms(schedule_service: ScheduleService) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_schedule_publish_handler_error_is_logged_as_warning(
+async def test_schedule_publish_handler_error_is_logged_as_error(
     db_session: AsyncSession,
 ) -> None:
-    """ScheduleService._publish logs WARNING for each failing event handler.
+    """ScheduleService._publish logs ERROR for each failing event handler.
 
-    ScheduleService uses logger.warning (not ERROR) for handler failures
-    because schedule events are not patient-safety critical.
+    R2-H5: ScheduleService uses logger.error for handler failures to ensure
+    event delivery problems are visible in monitoring.
     """
     from unittest.mock import patch
 
@@ -226,18 +226,18 @@ async def test_schedule_publish_handler_error_is_logged_as_warning(
             scheduled_start=start,
             scheduled_end=end,
         )
-        # _publish must call logger.warning for the handler failure
-        mock_logger.warning.assert_called()
-        warning_calls = mock_logger.warning.call_args_list
-        assert any("event_bus.handler_error" in str(call.args) for call in warning_calls), (
-            f"Expected 'event_bus.handler_error' in warnings. Got: {warning_calls}"
+        # _publish must call logger.error for the handler failure
+        mock_logger.error.assert_called()
+        error_calls = mock_logger.error.call_args_list
+        assert any("event_bus.handler_error" in str(call.args) for call in error_calls), (
+            f"Expected 'event_bus.handler_error' in errors. Got: {error_calls}"
         )
 
 
-async def test_schedule_publish_no_error_does_not_warn(
+async def test_schedule_publish_no_error_does_not_log_error(
     db_session: AsyncSession,
 ) -> None:
-    """ScheduleService._publish does NOT warn when all handlers succeed."""
+    """ScheduleService._publish does NOT log error when all handlers succeed."""
     from unittest.mock import patch
 
     from sautiris.core.events import EventBus
@@ -261,12 +261,12 @@ async def test_schedule_publish_no_error_does_not_warn(
             scheduled_start=start,
             scheduled_end=end,
         )
-        handler_error_warnings = [
+        handler_error_calls = [
             call
-            for call in mock_logger.warning.call_args_list
+            for call in mock_logger.error.call_args_list
             if "event_bus.handler_error" in str(call.args)
         ]
-        assert len(handler_error_warnings) == 0
+        assert len(handler_error_calls) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -463,3 +463,39 @@ async def test_update_slot_unknown_field_logs_warning(
     mock_logger.warning.assert_called()
     warning_key = mock_logger.warning.call_args[0][0]
     assert "unknown_fields" in warning_key
+
+
+# ---------------------------------------------------------------------------
+# R2-H5: ScheduleService._publish uses logger.error (not warning)
+# ---------------------------------------------------------------------------
+
+
+async def test_schedule_publish_handler_error_logged_at_error_level(
+    db_session: AsyncSession,
+) -> None:
+    """ScheduleService._publish logs handler failures at ERROR level."""
+    from unittest.mock import patch
+
+    from sautiris.core.events import EventBus
+
+    bus = EventBus()
+
+    async def _failing_handler(event: object) -> None:
+        raise ValueError("schedule notification down")
+
+    bus.subscribe("schedule.slot_created", _failing_handler)
+    svc = ScheduleService(db_session, event_bus=bus)
+
+    start, end = _make_times(offset_hours=100)
+    with patch("sautiris.services.schedule_service.logger") as mock_logger:
+        await svc.create_slot(
+            order_id=uuid.uuid4(),
+            room_id="ROOM-PUBLISH-ERR",
+            modality="CT",
+            scheduled_start=start,
+            scheduled_end=end,
+        )
+        # Must be logger.error, not logger.warning
+        mock_logger.error.assert_called()
+        error_key = mock_logger.error.call_args[0][0]
+        assert "event_bus.handler_error" in error_key

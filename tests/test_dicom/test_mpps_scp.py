@@ -679,3 +679,161 @@ class TestCurrentStatusCorruptedValue:
         event = _make_n_set_event("1.2.3.gap7.1", MPPS_STATUS_COMPLETED)
         status, _ = server._handle_n_set(event)
         assert status == 0x0110
+
+
+# ---------------------------------------------------------------------------
+# R2-C3: N-CREATE rollback _instances on callback failure
+# ---------------------------------------------------------------------------
+
+
+class TestNCreateCallbackRollback:
+    """R2-C3: _instances must be rolled back when N-CREATE callback fails."""
+
+    def test_instances_empty_after_failed_callback(self) -> None:
+        """Failed callback → SOP UID removed from _instances (no phantom state)."""
+        import asyncio
+        import threading
+
+        async def _failing_callback(mpps_uid: str, mpps_data: dict) -> None:
+            raise RuntimeError("DB write failed")
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            server = MPPSServer(status_callback=_failing_callback, loop=loop)
+            uid = "1.2.3.rollback.1"
+            event = _make_n_create_event(uid, MPPS_STATUS_IN_PROGRESS)
+            status, ds = server._handle_n_create(event)
+
+            assert status == 0xC001
+            assert ds is None
+            # The critical assertion: instance must NOT remain in memory
+            assert uid not in server._instances
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2.0)
+            loop.close()
+
+    def test_successful_callback_keeps_instance(self) -> None:
+        """Successful callback → SOP UID remains in _instances."""
+        import asyncio
+        import threading
+
+        async def _ok_callback(mpps_uid: str, mpps_data: dict) -> None:
+            pass
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            server = MPPSServer(status_callback=_ok_callback, loop=loop)
+            uid = "1.2.3.rollback.2"
+            event = _make_n_create_event(uid, MPPS_STATUS_IN_PROGRESS)
+            status, ds = server._handle_n_create(event)
+
+            assert status == 0x0000
+            assert uid in server._instances
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2.0)
+            loop.close()
+
+    def test_retry_n_create_after_rollback_succeeds(self) -> None:
+        """After failed N-CREATE + rollback, retrying the same UID must succeed."""
+        import asyncio
+        import threading
+
+        call_count = 0
+
+        async def _fail_then_succeed(mpps_uid: str, mpps_data: dict) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("transient failure")
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            server = MPPSServer(status_callback=_fail_then_succeed, loop=loop)
+            uid = "1.2.3.rollback.3"
+            event = _make_n_create_event(uid, MPPS_STATUS_IN_PROGRESS)
+
+            # First attempt fails
+            status1, _ = server._handle_n_create(event)
+            assert status1 == 0xC001
+            assert uid not in server._instances
+
+            # Retry succeeds (not rejected as duplicate)
+            status2, ds2 = server._handle_n_create(event)
+            assert status2 == 0x0000
+            assert ds2 is not None
+            assert uid in server._instances
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2.0)
+            loop.close()
+
+
+# ---------------------------------------------------------------------------
+# R2-H8: N-SET working copy preservation — stored instance unchanged on failure
+# ---------------------------------------------------------------------------
+
+
+class TestNSetWorkingCopyPreservation:
+    """R2-H8: N-SET callback failure must not mutate the stored instance."""
+
+    def test_stored_instance_unchanged_after_failed_nset_callback(self) -> None:
+        """Stored dataset status remains IN PROGRESS after failed N-SET callback."""
+        import asyncio
+        import threading
+
+        async def _failing_callback(mpps_uid: str, mpps_data: dict) -> None:
+            raise RuntimeError("DB write failed on N-SET")
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            # Seed an IN PROGRESS instance with no-callback server
+            seed_server = MPPSServer(status_callback=None, loop=None)
+            uid = "1.2.3.working.copy.1"
+            create_event = _make_n_create_event(uid, MPPS_STATUS_IN_PROGRESS)
+            c_status, _ = seed_server._handle_n_create(create_event)
+            assert c_status == 0x0000
+
+            # Build a failing server with the seeded instance
+            failing_server = MPPSServer(status_callback=_failing_callback, loop=loop)
+            failing_server._instances[uid] = seed_server._instances[uid]
+
+            # Attempt N-SET to COMPLETED (callback will fail)
+            set_event = _make_n_set_event(uid, MPPS_STATUS_COMPLETED)
+            status, ds = failing_server._handle_n_set(set_event)
+
+            assert status == 0xC001
+            assert ds is None
+
+            # The stored instance must still have status IN PROGRESS
+            stored = failing_server._instances[uid]
+            stored_status = str(getattr(stored, "PerformedProcedureStepStatus", "")).strip()
+            assert stored_status == "IN PROGRESS"
+
+            # The stored dataset should not have gained end date/time from the N-SET
+            assert not getattr(stored, "PerformedProcedureStepEndDate", None)
+            assert not getattr(stored, "PerformedProcedureStepEndTime", None)
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2.0)
+            loop.close()
+
+    def test_stored_instance_updated_after_successful_nset_callback(self) -> None:
+        """After successful N-SET, stored dataset reflects new COMPLETED status."""
+        server = MPPSServer()
+        uid = "1.2.3.working.copy.2"
+        server._handle_n_create(_make_n_create_event(uid, MPPS_STATUS_IN_PROGRESS))
+        server._handle_n_set(_make_n_set_event(uid, MPPS_STATUS_COMPLETED))
+
+        stored = server._instances[uid]
+        stored_status = str(getattr(stored, "PerformedProcedureStepStatus", "")).strip()
+        assert stored_status == "COMPLETED"

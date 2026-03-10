@@ -48,7 +48,7 @@ class WorklistService:
                         error=str(exc),
                     )
                 if isinstance(event, ExamCompleted):
-                    logger.error(
+                    logger.critical(
                         "event_bus.exam_completed_handlers_failed",
                         event_type=event.event_type,
                         error_count=len(errors),
