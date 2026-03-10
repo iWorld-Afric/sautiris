@@ -20,6 +20,7 @@ from sautiris.integrations.dicom.mpps_scp import (
     MPPSServer,
     extract_mpps_data,
 )
+from sautiris.models.mpps import MPPSStatusEnum
 
 
 class TestExtractMPPSData:
@@ -136,6 +137,10 @@ def _make_n_create_event(sop_uid: str, status: str = "IN PROGRESS") -> MagicMock
     """Build a mock pynetdicom EVT_N_CREATE event."""
     attr_list = Dataset()
     attr_list.PerformedProcedureStepStatus = status
+    attr_list.PerformedProcedureStepID = "PPS-TEST"
+    attr_list.PerformedStationAETitle = "TEST_AE"
+    attr_list.PerformedProcedureStepStartDate = "20260310"
+    attr_list.PerformedProcedureStepStartTime = "100000"
     request = MagicMock()
     request.AffectedSOPInstanceUID = sop_uid
     event = MagicMock()
@@ -148,6 +153,9 @@ def _make_n_set_event(sop_uid: str, new_status: str) -> MagicMock:
     """Build a mock pynetdicom EVT_N_SET event."""
     mod_list = Dataset()
     mod_list.PerformedProcedureStepStatus = new_status
+    if new_status in ("COMPLETED", MPPSStatusEnum.COMPLETED):
+        mod_list.PerformedProcedureStepEndDate = "20260310"
+        mod_list.PerformedProcedureStepEndTime = "160000"
     request = MagicMock()
     request.RequestedSOPInstanceUID = sop_uid
     event = MagicMock()
@@ -395,3 +403,212 @@ class TestInvokeCallbackErrorHandling:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2.0)
             loop.close()
+
+
+class TestIssue14RequiredAttributes:
+    """PS3.4 F.7.2 — required Type 1 attributes on N-CREATE and N-SET."""
+
+    def test_n_create_missing_step_id_rejected(self) -> None:
+        """N-CREATE without PerformedProcedureStepID → 0x0110."""
+        server = MPPSServer()
+        attr_list = Dataset()
+        attr_list.PerformedProcedureStepStatus = "IN PROGRESS"
+        attr_list.PerformedStationAETitle = "CT_1"
+        attr_list.PerformedProcedureStepStartDate = "20260310"
+        attr_list.PerformedProcedureStepStartTime = "143000"
+        # PerformedProcedureStepID deliberately missing
+        request = MagicMock()
+        request.AffectedSOPInstanceUID = "1.2.3.attr.1"
+        event = MagicMock()
+        event.attribute_list = attr_list
+        event.request = request
+        status, ds = server._handle_n_create(event)
+        assert status == 0x0110
+        assert ds is None
+
+    def test_n_create_missing_ae_title_rejected(self) -> None:
+        server = MPPSServer()
+        attr_list = Dataset()
+        attr_list.PerformedProcedureStepStatus = "IN PROGRESS"
+        attr_list.PerformedProcedureStepID = "PPS-001"
+        attr_list.PerformedProcedureStepStartDate = "20260310"
+        attr_list.PerformedProcedureStepStartTime = "143000"
+        # PerformedStationAETitle deliberately missing
+        request = MagicMock()
+        request.AffectedSOPInstanceUID = "1.2.3.attr.2"
+        event = MagicMock()
+        event.attribute_list = attr_list
+        event.request = request
+        status, ds = server._handle_n_create(event)
+        assert status == 0x0110
+
+    def test_n_create_all_required_attrs_succeeds(self) -> None:
+        server = MPPSServer()
+        event = _make_n_create_event("1.2.3.attr.3", MPPS_STATUS_IN_PROGRESS)
+        status, ds = server._handle_n_create(event)
+        assert status == 0x0000
+        assert ds is not None
+
+    def test_n_set_completed_missing_end_date_rejected(self) -> None:
+        server = MPPSServer()
+        server._handle_n_create(_make_n_create_event("1.2.3.attr.4", MPPS_STATUS_IN_PROGRESS))
+        # N-SET to COMPLETED without end date/time
+        mod_list = Dataset()
+        mod_list.PerformedProcedureStepStatus = "COMPLETED"
+        # Deliberately missing end date and time
+        request = MagicMock()
+        request.RequestedSOPInstanceUID = "1.2.3.attr.4"
+        event = MagicMock()
+        event.modification_list = mod_list
+        event.request = request
+        status, ds = server._handle_n_set(event)
+        assert status == 0x0110
+
+    def test_n_set_completed_with_end_date_succeeds(self) -> None:
+        server = MPPSServer()
+        server._handle_n_create(_make_n_create_event("1.2.3.attr.5", MPPS_STATUS_IN_PROGRESS))
+        event = _make_n_set_event("1.2.3.attr.5", MPPS_STATUS_COMPLETED)
+        status, ds = server._handle_n_set(event)
+        assert status == 0x0000
+        assert ds is not None
+
+    def test_n_set_discontinued_no_end_date_required(self) -> None:
+        """DISCONTINUED does not require end date/time per PS3.4 F.7.2."""
+        server = MPPSServer()
+        server._handle_n_create(_make_n_create_event("1.2.3.attr.6", MPPS_STATUS_IN_PROGRESS))
+        event = _make_n_set_event("1.2.3.attr.6", MPPS_STATUS_DISCONTINUED)
+        status, ds = server._handle_n_set(event)
+        assert status == 0x0000
+
+
+class TestPreloadActiveInstances:
+    """Test preload_active_instances for DB recovery on startup."""
+
+    def test_preload_populates_instances(self) -> None:
+        server = MPPSServer()
+        ds = Dataset()
+        ds.PerformedProcedureStepStatus = "IN PROGRESS"
+        server.preload_active_instances({"1.2.3.preload.1": ds})
+        assert "1.2.3.preload.1" in server._instances
+
+    def test_preloaded_instance_allows_n_set(self) -> None:
+        server = MPPSServer()
+        ds = Dataset()
+        ds.PerformedProcedureStepStatus = "IN PROGRESS"
+        server.preload_active_instances({"1.2.3.preload.2": ds})
+        event = _make_n_set_event("1.2.3.preload.2", MPPS_STATUS_COMPLETED)
+        status, _ = server._handle_n_set(event)
+        assert status == 0x0000
+
+    def test_preload_empty_dict(self) -> None:
+        server = MPPSServer()
+        server.preload_active_instances({})
+        assert server._instances == {}
+
+
+# ---------------------------------------------------------------------------
+# GAP-1: _validate_required_attrs empty-string branch
+# ---------------------------------------------------------------------------
+
+
+class TestValidateRequiredAttrsEmptyStrings:
+    """GAP-1: _validate_required_attrs must reject empty/whitespace-only Type 1 attrs."""
+
+    def test_n_create_empty_step_id_rejected(self) -> None:
+        """N-CREATE with empty string PerformedProcedureStepID → 0x0110."""
+        server = MPPSServer()
+        attr_list = Dataset()
+        attr_list.PerformedProcedureStepStatus = "IN PROGRESS"
+        attr_list.PerformedProcedureStepID = ""
+        attr_list.PerformedStationAETitle = "CT_1"
+        attr_list.PerformedProcedureStepStartDate = "20260310"
+        attr_list.PerformedProcedureStepStartTime = "143000"
+        request = MagicMock()
+        request.AffectedSOPInstanceUID = "1.2.3.gap1.1"
+        event = MagicMock()
+        event.attribute_list = attr_list
+        event.request = request
+        status, ds = server._handle_n_create(event)
+        assert status == 0x0110
+        assert ds is None
+
+    def test_n_create_whitespace_only_step_id_rejected(self) -> None:
+        """N-CREATE with whitespace-only PerformedProcedureStepID → 0x0110."""
+        server = MPPSServer()
+        attr_list = Dataset()
+        attr_list.PerformedProcedureStepStatus = "IN PROGRESS"
+        attr_list.PerformedProcedureStepID = "   "
+        attr_list.PerformedStationAETitle = "CT_1"
+        attr_list.PerformedProcedureStepStartDate = "20260310"
+        attr_list.PerformedProcedureStepStartTime = "143000"
+        request = MagicMock()
+        request.AffectedSOPInstanceUID = "1.2.3.gap1.2"
+        event = MagicMock()
+        event.attribute_list = attr_list
+        event.request = request
+        status, ds = server._handle_n_create(event)
+        assert status == 0x0110
+
+    def test_n_set_completed_empty_end_date_rejected(self) -> None:
+        """N-SET to COMPLETED with empty PerformedProcedureStepEndDate → 0x0110."""
+        server = MPPSServer()
+        server._handle_n_create(_make_n_create_event("1.2.3.gap1.3", MPPS_STATUS_IN_PROGRESS))
+        mod_list = Dataset()
+        mod_list.PerformedProcedureStepStatus = "COMPLETED"
+        mod_list.PerformedProcedureStepEndDate = ""
+        mod_list.PerformedProcedureStepEndTime = "160000"
+        request = MagicMock()
+        request.RequestedSOPInstanceUID = "1.2.3.gap1.3"
+        event = MagicMock()
+        event.modification_list = mod_list
+        event.request = request
+        status, ds = server._handle_n_set(event)
+        assert status == 0x0110
+
+
+# ---------------------------------------------------------------------------
+# GAP-5: preload_active_instances edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestPreloadEdgeCases:
+    """GAP-5: preload_active_instances overwrite and terminal-state behavior."""
+
+    def test_preloaded_uid_blocks_duplicate_n_create(self) -> None:
+        """Preloaded UID should block N-CREATE (duplicate detection)."""
+        server = MPPSServer()
+        ds = Dataset()
+        ds.PerformedProcedureStepStatus = "IN PROGRESS"
+        server.preload_active_instances({"1.2.3.gap5.1": ds})
+        event = _make_n_create_event("1.2.3.gap5.1", MPPS_STATUS_IN_PROGRESS)
+        status, _ = server._handle_n_create(event)
+        assert status == 0x0110
+
+    def test_preloaded_terminal_state_blocks_n_set(self) -> None:
+        """Preloaded COMPLETED instance should block N-SET (terminal state)."""
+        server = MPPSServer()
+        ds = Dataset()
+        ds.PerformedProcedureStepStatus = "COMPLETED"
+        server.preload_active_instances({"1.2.3.gap5.2": ds})
+        event = _make_n_set_event("1.2.3.gap5.2", MPPS_STATUS_DISCONTINUED)
+        status, _ = server._handle_n_set(event)
+        assert status == 0x0110
+
+
+# ---------------------------------------------------------------------------
+# GAP-7: _current_status with corrupted status value
+# ---------------------------------------------------------------------------
+
+
+class TestCurrentStatusCorruptedValue:
+    """GAP-7: _current_status returns None for invalid status, blocking N-SET."""
+
+    def test_corrupted_status_rejects_n_set(self) -> None:
+        """Stored dataset with invalid status string → N-SET returns 0x0110."""
+        server = MPPSServer()
+        ds = Dataset()
+        ds.PerformedProcedureStepStatus = "GARBAGE"
+        server._instances["1.2.3.gap7.1"] = ds
+        event = _make_n_set_event("1.2.3.gap7.1", MPPS_STATUS_COMPLETED)
+        status, _ = server._handle_n_set(event)
+        assert status == 0x0110

@@ -221,6 +221,12 @@ class OrderService:
         updated = await self.repo.update(order)
 
         # Emit typed event matching the target status
+        from sautiris.core.events import (  # noqa: PLC0415
+            OrderDistributed,
+            OrderReported,
+            OrderVerified,
+        )
+
         if target == OrderStatus.SCHEDULED:
             await self._publish(
                 OrderScheduled(
@@ -242,8 +248,34 @@ class OrderService:
                     tenant_id=updated.tenant_id,
                 )
             )
+        elif target == OrderStatus.CANCELLED:
+            pass  # Emitted by cancel_order() with reason
+        elif target == OrderStatus.REPORTED:
+            await self._publish(
+                OrderReported(
+                    order_id=str(updated.id),
+                    from_status=old_status,
+                    tenant_id=updated.tenant_id,
+                )
+            )
+        elif target == OrderStatus.VERIFIED:
+            await self._publish(
+                OrderVerified(
+                    order_id=str(updated.id),
+                    from_status=old_status,
+                    tenant_id=updated.tenant_id,
+                )
+            )
+        elif target == OrderStatus.DISTRIBUTED:
+            await self._publish(
+                OrderDistributed(
+                    order_id=str(updated.id),
+                    from_status=old_status,
+                    tenant_id=updated.tenant_id,
+                )
+            )
         else:
-            # Generic fallback for other transitions (cancelled, reported, etc.)
+            # Safety fallback for any future status not yet mapped
             await self._publish(
                 DomainEvent(
                     event_type="order.status_changed",
@@ -265,12 +297,23 @@ class OrderService:
         return updated
 
     async def cancel_order(self, order_id: uuid.UUID, *, reason: str) -> RadiologyOrder:
+        from sautiris.core.events import OrderCancelled  # noqa: PLC0415
+
         order = await self.get_order(order_id)
+        old_status = order.status
         result = await self._transition(order, OrderStatus.CANCELLED)
         result.special_instructions = (
             f"{result.special_instructions or ''}\nCANCELLED: {reason}".strip()
         )
         await self.repo.update(result)
+        await self._publish(
+            OrderCancelled(
+                order_id=str(result.id),
+                from_status=old_status,
+                reason=reason,
+                tenant_id=result.tenant_id,
+            )
+        )
         return result
 
     async def schedule_order(self, order_id: uuid.UUID, scheduled_at: datetime) -> RadiologyOrder:

@@ -8,6 +8,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from sautiris.integrations.dicom.store_scp import (
+    BASIC_SR_STORAGE,
     BREAST_TOMOSYNTHESIS_STORAGE,
     COMPREHENSIVE_SR_STORAGE,
     CT_IMAGE_STORAGE,
@@ -154,6 +155,10 @@ class TestIssue7SOPClasses:
 
     def test_breast_tomosynthesis(self) -> None:
         assert BREAST_TOMOSYNTHESIS_STORAGE in DEFAULT_STORAGE_SOP_CLASSES
+
+    def test_basic_sr_storage(self) -> None:
+        """Issue #7 — Basic Text SR must be in supported SOP classes."""
+        assert BASIC_SR_STORAGE in DEFAULT_STORAGE_SOP_CLASSES
 
     def test_is_rdsr_true_for_rdsr_uid(self) -> None:
         assert is_rdsr(RDSR_STORAGE) is True
@@ -442,9 +447,7 @@ class TestStoreSCPTimeout:
         mock_future: MagicMock = MagicMock(spec=concurrent.futures.Future)
         mock_future.result.side_effect = concurrent.futures.TimeoutError()
 
-        def _fake_run_coroutine_threadsafe(
-            coro: object, loop: object
-        ) -> MagicMock:
+        def _fake_run_coroutine_threadsafe(coro: object, loop: object) -> MagicMock:
             # Close the coroutine to prevent ResourceWarning
             if asyncio.iscoroutine(coro):
                 coro.close()  # type: ignore[union-attr]

@@ -74,6 +74,29 @@ class TestRateLimitMiddleware:
                 resp = await client.get("/health")
                 assert resp.status_code == 200
 
+    async def test_root_path_exempt(self) -> None:
+        """Root path '/' is exempt from rate limiting (GAP-6: load balancer probe)."""
+        app = FastAPI()
+        settings = SautiRISSettings(
+            rate_limit_enabled=True,
+            rate_limit_general="1/minute",
+            rate_limit_auth_endpoints="1/minute",
+            rate_limit_apikey_create="1/minute",
+            rate_limit_trusted_ips=[],
+            database_url="sqlite+aiosqlite:///:memory:",
+        )
+        app.add_middleware(RateLimitMiddleware, settings=settings)
+
+        @app.get("/")
+        async def root() -> JSONResponse:
+            return JSONResponse({"status": "ok"})
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            for _ in range(10):
+                resp = await client.get("/")
+                assert resp.status_code == 200
+
     async def test_disabled_rate_limiting(self) -> None:
         app = _make_limited_app(general_rate="1/minute", enabled=False)
         transport = ASGITransport(app=app)

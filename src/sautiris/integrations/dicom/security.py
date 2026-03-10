@@ -159,15 +159,15 @@ class DicomAssociationSecurity:
                 calling_ae=calling_ae,
                 ip=ip,
             )
-            raise RuntimeError(f"AE title '{calling_ae}' not in whitelist")
+            raise RuntimeError("Association rejected")
 
         if not self.check_rate_limit(ip):
             logger.warning("dicom.security.rate_limit_exceeded", ip=ip)
-            raise RuntimeError(f"Rate limit exceeded for {ip}")
+            raise RuntimeError("Association rejected")
 
         if not self.acquire_connection(ip):
             logger.warning("dicom.security.connection_limit_exceeded", ip=ip)
-            raise RuntimeError(f"Connection limit exceeded for {ip}")
+            raise RuntimeError("Association rejected")
 
         logger.info("dicom.security.association_accepted", calling_ae=calling_ae, ip=ip)
 

@@ -16,9 +16,14 @@ from pydicom.dataset import Dataset
 from pydicom.uid import generate_uid
 from pynetdicom import AE, evt
 
+from sautiris.integrations.dicom.constants import CHARSET_UTF8, DEFAULT_TRANSFER_SYNTAXES
+
 if TYPE_CHECKING:
+    import ssl  # noqa: F401
+
     from pynetdicom.events import Event
 
+    from sautiris.integrations.dicom.security import DicomAssociationSecurity  # noqa: F401
     from sautiris.models.worklist import WorklistItem
 
 logger = structlog.get_logger(__name__)
@@ -26,20 +31,8 @@ logger = structlog.get_logger(__name__)
 # Modality Worklist Information Model - FIND SOP Class
 MWL_FIND_SOP_CLASS = "1.2.840.10008.5.1.4.31"
 
-# SpecificCharacterSet for UTF-8 (ISO_IR 192) — Issue #5
-CHARSET_UTF8 = "ISO_IR 192"
-
-# Transfer syntaxes supported by this SCP — Issue #9
-TRANSFER_SYNTAXES: list[str] = [
-    "1.2.840.10008.1.2.1",    # Explicit VR Little Endian
-    "1.2.840.10008.1.2",      # Implicit VR Little Endian
-    "1.2.840.10008.1.2.4.50", # JPEG Baseline (Process 1)
-    "1.2.840.10008.1.2.4.70", # JPEG Lossless (Process 14 SV1)
-    "1.2.840.10008.1.2.4.90", # JPEG 2000 Lossless Only
-    "1.2.840.10008.1.2.4.91", # JPEG 2000
-    "1.2.840.10008.1.2.5",    # RLE Lossless
-    "1.2.840.10008.1.2.1.99", # Deflated Explicit VR Little Endian
-]
+# Re-exported for backwards compatibility
+TRANSFER_SYNTAXES = DEFAULT_TRANSFER_SYNTAXES
 
 
 def worklist_item_to_dataset(item: WorklistItem) -> Dataset:
@@ -114,6 +107,9 @@ def worklist_item_to_dataset(item: WorklistItem) -> Dataset:
     sps.ScheduledProcedureStepID = item.scheduled_procedure_step_id or ""
     sps.ScheduledProcedureStepDescription = item.scheduled_procedure_step_description or ""
     sps.ScheduledProcedureStepStatus = str(getattr(item, "status", "") or "")
+    sps.ScheduledPerformingPhysicianName = str(
+        getattr(item, "scheduled_performing_physician_name", "") or ""
+    )
 
     if item.scheduled_start:
         if isinstance(item.scheduled_start, datetime):
@@ -149,7 +145,13 @@ def extract_query_filters(identifier: Dataset) -> dict[str, Any]:
 
     patient_name = getattr(identifier, "PatientName", None)
     if patient_name and str(patient_name).strip():
-        filters["patient_name"] = str(patient_name).strip()
+        name_str = str(patient_name).strip()
+        if "*" in name_str or "?" in name_str:
+            # DICOM wildcard query (PS3.4 C.2.2.2.4) — convert to SQL LIKE pattern
+            like_pattern = name_str.replace("*", "%").replace("?", "_")
+            filters["patient_name_pattern"] = like_pattern
+        else:
+            filters["patient_name"] = name_str
 
     accession = getattr(identifier, "AccessionNumber", None)
     if accession and str(accession).strip():
@@ -219,12 +221,20 @@ class MWLServer:
         query_callback: Callable[..., Any] | None = None,
         loop: asyncio.AbstractEventLoop | None = None,
         bind_address: str = "127.0.0.1",
+        security: DicomAssociationSecurity | None = None,
+        tls_cert: str = "",
+        tls_key: str = "",
+        tls_ca_cert: str = "",
     ) -> None:
         self.ae_title = ae_title
         self.port = port
         self._query_callback = query_callback
         self._loop = loop
         self._bind_address = bind_address
+        self._security = security
+        self._tls_cert = tls_cert
+        self._tls_key = tls_key
+        self._tls_ca_cert = tls_ca_cert
         self._ae: AE | None = None
 
     def _handle_find(self, event: Event) -> Any:
@@ -255,19 +265,56 @@ class MWLServer:
                     exc_info=True,
                 )
 
+    def _build_ssl_context(self) -> ssl.SSLContext | None:
+        """Build an SSL context from TLS cert/key/CA parameters.
+
+        Returns None if TLS is not configured (no cert+key provided).
+        """
+        if not (self._tls_cert and self._tls_key):
+            return None
+        import ssl
+
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(certfile=self._tls_cert, keyfile=self._tls_key)
+        if self._tls_ca_cert:
+            ctx.load_verify_locations(cafile=self._tls_ca_cert)
+            ctx.verify_mode = ssl.CERT_REQUIRED
+        return ctx
+
     def start(self) -> None:
         """Start the MWL SCP in non-blocking mode."""
         self._ae = AE(ae_title=self.ae_title)
         # Issue #9 — register all 8 supported transfer syntaxes
         self._ae.add_supported_context(MWL_FIND_SOP_CLASS, TRANSFER_SYNTAXES)
 
-        handlers = [(evt.EVT_C_FIND, self._handle_find)]
+        handlers: list[tuple[Any, Any]] = [
+            (evt.EVT_C_FIND, self._handle_find),
+        ]
+
+        # Issue #6 — wire DicomAssociationSecurity handlers
+        if self._security:
+            handlers.extend(
+                [
+                    (evt.EVT_REQUESTED, self._security.handle_association_request),
+                    (evt.EVT_RELEASED, self._security.handle_association_released),
+                    (evt.EVT_ABORTED, self._security.handle_association_aborted),
+                ]
+            )
+
+        ssl_context = self._build_ssl_context()
         self._ae.start_server(
             (self._bind_address, self.port),
             block=False,
+            ssl_context=ssl_context,
             evt_handlers=handlers,  # type: ignore[arg-type]
         )
-        logger.info("mwl.server_started", ae_title=self.ae_title, port=self.port)
+        logger.info(
+            "mwl.server_started",
+            ae_title=self.ae_title,
+            port=self.port,
+            tls_enabled=ssl_context is not None,
+        )
 
     def stop(self) -> None:
         """Stop the MWL SCP."""

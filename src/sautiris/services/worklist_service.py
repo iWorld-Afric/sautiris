@@ -201,6 +201,11 @@ class WorklistService:
         *,
         extra: dict[str, str] | None = None,
     ) -> None:
+        from sautiris.core.events import (  # noqa: PLC0415
+            WorklistMPPSReceived,
+            WorklistStatusChanged,
+        )
+
         if event_type == "exam.started":
             await self._publish(
                 ExamStarted(
@@ -214,6 +219,26 @@ class WorklistService:
                 ExamCompleted(
                     order_id=str(item.order_id),
                     worklist_item_id=str(item.id),
+                    tenant_id=item.tenant_id,
+                )
+            )
+        elif event_type == "worklist.status_changed":
+            await self._publish(
+                WorklistStatusChanged(
+                    item_id=str(item.id),
+                    order_id=str(item.order_id),
+                    from_status=(extra or {}).get("from_status", ""),
+                    to_status=(extra or {}).get("to_status", ""),
+                    tenant_id=item.tenant_id,
+                )
+            )
+        elif event_type == "worklist.mpps_received":
+            await self._publish(
+                WorklistMPPSReceived(
+                    item_id=str(item.id),
+                    order_id=str(item.order_id),
+                    mpps_status=(extra or {}).get("mpps_status", ""),
+                    mpps_uid=(extra or {}).get("mpps_uid", ""),
                     tenant_id=item.tenant_id,
                 )
             )

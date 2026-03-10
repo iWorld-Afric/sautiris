@@ -232,7 +232,7 @@ class ReportService:
             report.recommendation = recommendation
         updated = await self.report_repo.update(report)
         await self._create_version(updated, changed_by=changed_by)
-        await self._emit("report.amended", updated)
+        await self._emit("report.amended", updated, changed_by=changed_by)
         logger.info("report_amended", report_id=str(report_id))
         return updated
 
@@ -292,14 +292,24 @@ class ReportService:
         )
         return await self.report_repo.create_version(version)
 
-    async def _emit(self, event_type: str, report: RadiologyReport) -> None:
+    async def _emit(
+        self,
+        event_type: str,
+        report: RadiologyReport,
+        *,
+        changed_by: uuid.UUID | None = None,
+    ) -> None:
+        from sautiris.core.events import ReportAmended, ReportCreated  # noqa: PLC0415
+
+        reported_by_str = str(report.reported_by) if report.reported_by else ""
+
         if event_type == "report.finalized":
             await self._publish(
                 ReportFinalized(
                     order_id=str(report.order_id),
                     report_id=str(report.id),
                     accession_number=report.accession_number,
-                    reported_by=str(report.reported_by) if report.reported_by else "",
+                    reported_by=reported_by_str,
                     is_critical=report.is_critical,
                     tenant_id=report.tenant_id,
                 )
@@ -313,6 +323,26 @@ class ReportService:
                         tenant_id=report.tenant_id,
                     )
                 )
+        elif event_type == "report.created":
+            await self._publish(
+                ReportCreated(
+                    report_id=str(report.id),
+                    order_id=str(report.order_id),
+                    accession_number=report.accession_number,
+                    reported_by=reported_by_str,
+                    tenant_id=report.tenant_id,
+                )
+            )
+        elif event_type == "report.amended":
+            await self._publish(
+                ReportAmended(
+                    report_id=str(report.id),
+                    order_id=str(report.order_id),
+                    accession_number=report.accession_number,
+                    changed_by=str(changed_by) if changed_by else "",
+                    tenant_id=report.tenant_id,
+                )
+            )
         else:
             await self._publish(
                 DomainEvent(

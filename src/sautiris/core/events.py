@@ -184,6 +184,151 @@ class AIFindingCreated(DomainEvent):
 
 
 # ---------------------------------------------------------------------------
+# Order lifecycle events (Issue #16)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OrderCancelled(DomainEvent):
+    """Emitted when a radiology order is cancelled."""
+
+    event_type: str = field(init=False, default="order.cancelled")
+    payload: dict[str, Any] = field(default_factory=dict)
+
+    order_id: str = ""
+    from_status: str = ""
+    reason: str = ""
+
+
+@dataclass
+class OrderReported(DomainEvent):
+    """Emitted when a radiology order transitions to REPORTED status."""
+
+    event_type: str = field(init=False, default="order.reported")
+    payload: dict[str, Any] = field(default_factory=dict)
+
+    order_id: str = ""
+    from_status: str = ""
+
+
+@dataclass
+class OrderVerified(DomainEvent):
+    """Emitted when a radiology order transitions to VERIFIED status."""
+
+    event_type: str = field(init=False, default="order.verified")
+    payload: dict[str, Any] = field(default_factory=dict)
+
+    order_id: str = ""
+    from_status: str = ""
+
+
+@dataclass
+class OrderDistributed(DomainEvent):
+    """Emitted when a radiology order transitions to DISTRIBUTED status."""
+
+    event_type: str = field(init=False, default="order.distributed")
+    payload: dict[str, Any] = field(default_factory=dict)
+
+    order_id: str = ""
+    from_status: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Report lifecycle events (Issue #16)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ReportCreated(DomainEvent):
+    """Emitted when a radiology report is created."""
+
+    event_type: str = field(init=False, default="report.created")
+    payload: dict[str, Any] = field(default_factory=dict)
+
+    report_id: str = ""
+    order_id: str = ""
+    accession_number: str = ""
+    reported_by: str = ""
+
+
+@dataclass
+class ReportAmended(DomainEvent):
+    """Emitted when a radiology report is amended."""
+
+    event_type: str = field(init=False, default="report.amended")
+    payload: dict[str, Any] = field(default_factory=dict)
+
+    report_id: str = ""
+    order_id: str = ""
+    accession_number: str = ""
+    changed_by: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Worklist lifecycle events (Issue #16)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WorklistStatusChanged(DomainEvent):
+    """Emitted when a worklist item status changes (e.g. DISCONTINUED)."""
+
+    event_type: str = field(init=False, default="worklist.status_changed")
+    payload: dict[str, Any] = field(default_factory=dict)
+
+    item_id: str = ""
+    order_id: str = ""
+    from_status: str = ""
+    to_status: str = ""
+
+
+@dataclass
+class WorklistMPPSReceived(DomainEvent):
+    """Emitted when an MPPS message is received for a worklist item."""
+
+    event_type: str = field(init=False, default="worklist.mpps_received")
+    payload: dict[str, Any] = field(default_factory=dict)
+
+    item_id: str = ""
+    order_id: str = ""
+    mpps_status: str = ""
+    mpps_uid: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Schedule lifecycle events (Issue #16)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ScheduleSlotCreated(DomainEvent):
+    """Emitted when a schedule slot is created."""
+
+    event_type: str = field(init=False, default="schedule.slot_created")
+    payload: dict[str, Any] = field(default_factory=dict)
+
+    slot_id: str = ""
+    order_id: str = ""
+    room_id: str = ""
+    modality: str = ""
+    status: str = ""
+
+
+@dataclass
+class ScheduleSlotUpdated(DomainEvent):
+    """Emitted when a schedule slot is updated."""
+
+    event_type: str = field(init=False, default="schedule.slot_updated")
+    payload: dict[str, Any] = field(default_factory=dict)
+
+    slot_id: str = ""
+    order_id: str = ""
+    room_id: str = ""
+    modality: str = ""
+    status: str = ""
+
+
+# ---------------------------------------------------------------------------
 # Event bus
 # ---------------------------------------------------------------------------
 

@@ -381,3 +381,195 @@ class TestMWLServer:
 
     def test_sop_class_uid(self) -> None:
         assert MWL_FIND_SOP_CLASS == "1.2.840.10008.5.1.4.31"
+
+
+class TestScheduledPerformingPhysicianName:
+    """G3-2: ScheduledPerformingPhysicianName in SPS response."""
+
+    def test_performing_physician_present_in_sps(self) -> None:
+        item = _make_worklist_item(scheduled_performing_physician_name="DR^JONES")
+        ds = worklist_item_to_dataset(item)
+        sps = ds.ScheduledProcedureStepSequence[0]
+        assert str(sps.ScheduledPerformingPhysicianName) == "DR^JONES"
+
+    def test_performing_physician_empty_when_none(self) -> None:
+        item = _make_worklist_item()
+        ds = worklist_item_to_dataset(item)
+        sps = ds.ScheduledProcedureStepSequence[0]
+        assert str(sps.ScheduledPerformingPhysicianName) == ""
+
+
+class TestPatientNameWildcardFilters:
+    """G3-1: DICOM wildcard matching for PatientName C-FIND queries."""
+
+    def test_wildcard_star_suffix(self) -> None:
+        ds = Dataset()
+        ds.PatientName = "DOE*"
+        filters = extract_query_filters(ds)
+        assert "patient_name" not in filters
+        assert filters["patient_name_pattern"] == "DOE%"
+
+    def test_wildcard_question_mark(self) -> None:
+        ds = Dataset()
+        ds.PatientName = "DO?"
+        filters = extract_query_filters(ds)
+        assert filters["patient_name_pattern"] == "DO_"
+
+    def test_wildcard_combined(self) -> None:
+        ds = Dataset()
+        ds.PatientName = "D?E*"
+        filters = extract_query_filters(ds)
+        assert filters["patient_name_pattern"] == "D_E%"
+
+    def test_exact_match_no_wildcards(self) -> None:
+        ds = Dataset()
+        ds.PatientName = "DOE^JOHN"
+        filters = extract_query_filters(ds)
+        assert filters["patient_name"] == "DOE^JOHN"
+        assert "patient_name_pattern" not in filters
+
+    def test_wildcard_star_only(self) -> None:
+        ds = Dataset()
+        ds.PatientName = "*"
+        filters = extract_query_filters(ds)
+        assert filters["patient_name_pattern"] == "%"
+
+
+# ---------------------------------------------------------------------------
+# GAP-2: _handle_find callback exception path
+# ---------------------------------------------------------------------------
+
+
+class TestHandleFindCallbackErrors:
+    """GAP-2: _handle_find must yield 0xC001 when query_callback raises."""
+
+    def test_callback_exception_yields_error_status(self) -> None:
+        """When query_callback raises, _handle_find yields (0xC001, None)."""
+        import asyncio
+        import threading
+
+        async def _failing_callback(filters: dict) -> list:
+            raise RuntimeError("Database connection lost")
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            server = MWLServer(query_callback=_failing_callback, loop=loop)
+            identifier = Dataset()  # empty = universal match
+            event_mock = SimpleNamespace(identifier=identifier)
+            results = list(server._handle_find(event_mock))
+            assert len(results) == 1
+            status, ds = results[0]
+            assert status == 0xC001
+            assert ds is None
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2.0)
+            loop.close()
+
+
+# ---------------------------------------------------------------------------
+# GAP-3: _handle_find per-item conversion error isolation
+# ---------------------------------------------------------------------------
+
+
+class TestHandleFindItemConversionError:
+    """GAP-3: A single bad item must not abort the entire C-FIND."""
+
+    def test_bad_item_skipped_others_returned(self) -> None:
+        """If worklist_item_to_dataset raises for one item, others still yield."""
+        import asyncio
+        import threading
+
+        good_item_1 = _make_worklist_item(patient_id="PAT-GOOD-1")
+
+        # Create a bad item that raises during dataset conversion by using
+        # a property that explodes when accessed
+        class _ExplodingItem:
+            """Mock item that raises when patient_name is accessed."""
+
+            id = "BAD-ITEM"
+
+            @property
+            def patient_name(self) -> str:
+                raise ValueError("Corrupted DB record")
+
+        bad_item = _ExplodingItem()
+        good_item_3 = _make_worklist_item(patient_id="PAT-GOOD-3")
+
+        async def _callback(filters: dict) -> list:
+            return [good_item_1, bad_item, good_item_3]
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            server = MWLServer(query_callback=_callback, loop=loop)
+            identifier = Dataset()
+            event_mock = SimpleNamespace(identifier=identifier)
+            results = list(server._handle_find(event_mock))
+            # Only good items should be returned (0xFF00 = pending match)
+            success_results = [(s, d) for s, d in results if s == 0xFF00]
+            assert len(success_results) == 2
+            patient_ids = [str(d.PatientID) for _, d in success_results]
+            assert "PAT-GOOD-1" in patient_ids
+            assert "PAT-GOOD-3" in patient_ids
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2.0)
+            loop.close()
+
+
+# ---------------------------------------------------------------------------
+# GAP-6: Shared constants.py direct coverage
+# ---------------------------------------------------------------------------
+
+
+class TestSharedConstants:
+    """GAP-6: Verify shared constants from constants.py are correct."""
+
+    def test_charset_utf8_value(self) -> None:
+        from sautiris.integrations.dicom.constants import CHARSET_UTF8 as SHARED_CHARSET
+
+        assert SHARED_CHARSET == "ISO_IR 192"
+
+    def test_default_transfer_syntaxes_count(self) -> None:
+        from sautiris.integrations.dicom.constants import DEFAULT_TRANSFER_SYNTAXES
+
+        assert len(DEFAULT_TRANSFER_SYNTAXES) == 8
+
+    def test_default_transfer_syntaxes_contains_key_uids(self) -> None:
+        from sautiris.integrations.dicom.constants import DEFAULT_TRANSFER_SYNTAXES
+
+        assert "1.2.840.10008.1.2.1" in DEFAULT_TRANSFER_SYNTAXES  # Explicit VR LE
+        assert "1.2.840.10008.1.2" in DEFAULT_TRANSFER_SYNTAXES  # Implicit VR LE
+
+
+# ---------------------------------------------------------------------------
+# GAP-8: Open-ended date range patterns
+# ---------------------------------------------------------------------------
+
+
+class TestOpenEndedDateRanges:
+    """GAP-8: DICOM open-ended date range queries."""
+
+    def test_open_end_date_range(self) -> None:
+        """'20260301-' sets date_from only."""
+        ds = Dataset()
+        sps = Dataset()
+        sps.ScheduledProcedureStepStartDate = "20260301-"
+        ds.ScheduledProcedureStepSequence = [sps]
+        filters = extract_query_filters(ds)
+        assert filters["date_from"] == date(2026, 3, 1)
+        assert "date_to" not in filters
+
+    def test_open_start_date_range(self) -> None:
+        """'-20260305' sets date_to only."""
+        ds = Dataset()
+        sps = Dataset()
+        sps.ScheduledProcedureStepStartDate = "-20260305"
+        ds.ScheduledProcedureStepSequence = [sps]
+        filters = extract_query_filters(ds)
+        assert "date_from" not in filters
+        assert filters["date_to"] == date(2026, 3, 5)

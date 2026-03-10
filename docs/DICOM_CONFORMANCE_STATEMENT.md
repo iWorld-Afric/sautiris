@@ -138,7 +138,7 @@ with universal matching semantics (empty value = match all):
 | Attribute                          | Tag        | Match Type       |
 |------------------------------------|------------|------------------|
 | PatientID                          | (0010,0020)| Universal / Exact|
-| PatientName                        | (0010,0010)| Universal / Exact|
+| PatientName                        | (0010,0010)| Universal / Exact / Wildcard (*,?)|
 | AccessionNumber                    | (0008,0050)| Universal / Exact|
 | RequestedProcedureID               | (0040,1001)| Universal / Exact|
 | Modality                           | (0008,0060)| Universal / Exact|
@@ -170,6 +170,7 @@ Each response dataset includes the following attributes (DICOM PS3.4 Annex K):
   - ScheduledProcedureStepStartDate/Time
   - ScheduledProcedureStepID, ScheduledProcedureStepDescription
   - ScheduledProcedureStepStatus
+  - ScheduledPerformingPhysicianName
 
 **SpecificCharacterSet**: `ISO_IR 192` (UTF-8) is set on all outbound datasets.
 
@@ -204,6 +205,18 @@ Constraints:
   - Duplicate N-CREATE for existing SOP Instance UID → 0x0110
   - N-SET from terminal state → 0x0110
   - N-SET with target status other than COMPLETED/DISCONTINUED → 0x0110
+
+Type 1 Attribute Validation (PS3.4 F.7.2):
+  - N-CREATE requires: PerformedProcedureStepID, PerformedStationAETitle,
+    PerformedProcedureStepStartDate, PerformedProcedureStepStartTime
+  - N-SET to COMPLETED requires: PerformedProcedureStepEndDate,
+    PerformedProcedureStepEndTime
+  - Missing required attributes → 0x0110
+
+Persistence:
+  - MPPS instances are tracked in-memory for fast state lookups
+  - DB persistence via callback (mpps_instances table)
+  - On restart, active instances can be preloaded via preload_active_instances()
 ```
 
 MPPS instances are persisted to the `mpps_instances` table (PostgreSQL).
@@ -214,7 +227,7 @@ MPPS instances are persisted to the `mpps_instances` table (PostgreSQL).
 
 **Role**: Service Class Provider (SCP)
 
-#### 5.3.1 Supported SOP Classes (29 classes)
+#### 5.3.1 Supported SOP Classes (30 classes)
 
 | SOP Class                                   | SOP Class UID                     |
 |---------------------------------------------|-----------------------------------|
@@ -234,6 +247,7 @@ MPPS instances are persisted to the `mpps_instances` table (PostgreSQL).
 | X-Ray Angiographic Image Storage            | `1.2.840.10008.5.1.4.1.1.12.1`   |
 | Enhanced X-Ray Angiographic Image Storage   | `1.2.840.10008.5.1.4.1.1.12.1.1` |
 | X-Ray RF Image Storage                      | `1.2.840.10008.5.1.4.1.1.12.2`   |
+| Basic Text SR Storage                       | `1.2.840.10008.5.1.4.1.1.88.11`  |
 | Radiation Dose SR Storage (RDSR)            | `1.2.840.10008.5.1.4.1.1.88.67`  |
 | Enhanced SR Storage                         | `1.2.840.10008.5.1.4.1.1.88.22`  |
 | Comprehensive SR Storage                    | `1.2.840.10008.5.1.4.1.1.88.33`  |
@@ -298,12 +312,14 @@ service provider per PS3.8.
 | `SAUTIRIS_DICOM_TLS_KEY`             | `""`                | Server key path           |
 | `SAUTIRIS_ENABLE_DICOM_MWL`          | `true`              | Enable MWL SCP            |
 | `SAUTIRIS_ENABLE_DICOM_MPPS`         | `true`              | Enable MPPS SCP           |
+| `SAUTIRIS_DICOM_TRANSFER_SYNTAXES`   | `(unset = 8 defaults)` | Custom transfer syntax UIDs |
+| `SAUTIRIS_DICOM_STORE_SOP_CLASSES`   | `(unset = 30 defaults)`| Custom Storage SOP classes  |
 
 ---
 
 ## 8. Limitations and Notes
 
-1. **MWL Fuzzy Matching**: Not supported. Only universal (empty=all) and exact matching.
+1. **MWL Matching**: Universal (empty=all), exact, and wildcard (`*`, `?`) matching supported for PatientName. Fuzzy (phonetic) matching is not supported.
 2. **C-MOVE**: Not implemented. PACS retrieval uses DICOMweb WADO-RS instead.
 3. **C-GET**: Not implemented.
 4. **Storage Commitment**: Not implemented in v1.0.

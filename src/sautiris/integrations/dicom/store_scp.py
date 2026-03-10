@@ -14,25 +14,19 @@ from typing import TYPE_CHECKING, Any
 import structlog
 from pynetdicom import AE, evt
 
+from sautiris.integrations.dicom.constants import DEFAULT_TRANSFER_SYNTAXES
+
 if TYPE_CHECKING:
+    import ssl  # noqa: F401
+
     from pynetdicom.events import Event
+
+    from sautiris.integrations.dicom.security import DicomAssociationSecurity  # noqa: F401
 
 logger = structlog.get_logger(__name__)
 
-# SpecificCharacterSet for UTF-8 (ISO_IR 192) — Issue #5
-CHARSET_UTF8 = "ISO_IR 192"
-
-# Transfer syntaxes supported by this SCP — Issue #9
-TRANSFER_SYNTAXES: list[str] = [
-    "1.2.840.10008.1.2.1",    # Explicit VR Little Endian
-    "1.2.840.10008.1.2",      # Implicit VR Little Endian
-    "1.2.840.10008.1.2.4.50", # JPEG Baseline (Process 1)
-    "1.2.840.10008.1.2.4.70", # JPEG Lossless (Process 14 SV1)
-    "1.2.840.10008.1.2.4.90", # JPEG 2000 Lossless Only
-    "1.2.840.10008.1.2.4.91", # JPEG 2000
-    "1.2.840.10008.1.2.5",    # RLE Lossless
-    "1.2.840.10008.1.2.1.99", # Deflated Explicit VR Little Endian
-]
+# Re-exported for backwards compatibility
+TRANSFER_SYNTAXES = DEFAULT_TRANSFER_SYNTAXES
 
 # ---------------------------------------------------------------------------
 # Storage SOP Class UIDs — Issue #7: expanded to 25+ classes
@@ -63,14 +57,15 @@ ENHANCED_XA_STORAGE = "1.2.840.10008.5.1.4.1.1.12.1.1"
 RF_IMAGE_STORAGE = "1.2.840.10008.5.1.4.1.1.12.2"
 
 # Structured Reporting
-RDSR_STORAGE = "1.2.840.10008.5.1.4.1.1.88.67"           # Radiation Dose SR
-ENHANCED_SR_STORAGE = "1.2.840.10008.5.1.4.1.1.88.22"    # Enhanced SR
+BASIC_SR_STORAGE = "1.2.840.10008.5.1.4.1.1.88.11"  # Basic Text SR
+RDSR_STORAGE = "1.2.840.10008.5.1.4.1.1.88.67"  # Radiation Dose SR
+ENHANCED_SR_STORAGE = "1.2.840.10008.5.1.4.1.1.88.22"  # Enhanced SR
 COMPREHENSIVE_SR_STORAGE = "1.2.840.10008.5.1.4.1.1.88.33"  # Comprehensive SR
-KEY_OBJECT_SELECTION = "1.2.840.10008.5.1.4.1.1.88.59"    # Key Object Selection
+KEY_OBJECT_SELECTION = "1.2.840.10008.5.1.4.1.1.88.59"  # Key Object Selection
 
 # Documents / Presentation
 ENCAPSULATED_PDF = "1.2.840.10008.5.1.4.1.1.104.1"
-GRAYSCALE_SOFTCOPY_PS = "1.2.840.10008.5.1.4.1.1.11.1"   # Grayscale Softcopy PS
+GRAYSCALE_SOFTCOPY_PS = "1.2.840.10008.5.1.4.1.1.11.1"  # Grayscale Softcopy PS
 
 # Radiotherapy
 RT_IMAGE_STORAGE = "1.2.840.10008.5.1.4.1.1.481.1"
@@ -112,6 +107,7 @@ DEFAULT_STORAGE_SOP_CLASSES: list[str] = [
     ENHANCED_XA_STORAGE,
     RF_IMAGE_STORAGE,
     # Structured Reporting (RDSR routes to dose pipeline)
+    BASIC_SR_STORAGE,
     RDSR_STORAGE,
     ENHANCED_SR_STORAGE,
     COMPREHENSIVE_SR_STORAGE,
@@ -171,17 +167,27 @@ class StoreSCPServer:
         loop: The asyncio event loop to run async callbacks on.
         storage_sop_classes: List of Storage SOP Class UIDs to accept.
         bind_address: IP address to bind to (default ``"127.0.0.1"``).
+        security: Optional DicomAssociationSecurity for AE whitelist/rate/connection limits.
+        tls_cert: Path to TLS certificate file for DICOM TLS.
+        tls_key: Path to TLS private key file for DICOM TLS.
+        tls_ca_cert: Path to CA certificate file for mutual TLS (client verification).
     """
 
     def __init__(
         self,
         ae_title: str = "SAUTIRIS_STORE",
         port: int = 11114,
-        store_callback: Callable[[bytes, dict[str, str]], Coroutine[Any, Any, None]] | None = None,
-        rdsr_callback: Callable[[Any, dict[str, str]], Coroutine[Any, Any, None]] | None = None,
+        store_callback: (
+            Callable[[bytes, dict[str, str]], Coroutine[Any, Any, None]] | None
+        ) = None,
+        rdsr_callback: (Callable[[Any, dict[str, str]], Coroutine[Any, Any, None]] | None) = None,
         loop: asyncio.AbstractEventLoop | None = None,
         storage_sop_classes: list[str] | None = None,
         bind_address: str = "127.0.0.1",
+        security: DicomAssociationSecurity | None = None,
+        tls_cert: str = "",
+        tls_key: str = "",
+        tls_ca_cert: str = "",
     ) -> None:
         self.ae_title = ae_title
         self.port = port
@@ -190,6 +196,10 @@ class StoreSCPServer:
         self._loop = loop
         self._storage_sop_classes = storage_sop_classes or DEFAULT_STORAGE_SOP_CLASSES
         self._bind_address = bind_address
+        self._security = security
+        self._tls_cert = tls_cert
+        self._tls_key = tls_key
+        self._tls_ca_cert = tls_ca_cert
         self._ae: AE | None = None
         self._received_count: int = 0
 
@@ -281,6 +291,23 @@ class StoreSCPServer:
 
         return 0x0000  # Success
 
+    def _build_ssl_context(self) -> ssl.SSLContext | None:
+        """Build an SSL context from TLS cert/key/CA parameters.
+
+        Returns None if TLS is not configured (no cert+key provided).
+        """
+        if not (self._tls_cert and self._tls_key):
+            return None
+        import ssl
+
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(certfile=self._tls_cert, keyfile=self._tls_key)
+        if self._tls_ca_cert:
+            ctx.load_verify_locations(cafile=self._tls_ca_cert)
+            ctx.verify_mode = ssl.CERT_REQUIRED
+        return ctx
+
     def start(self) -> None:
         """Start the C-STORE SCP in non-blocking mode."""
         self._ae = AE(ae_title=self.ae_title)
@@ -289,10 +316,25 @@ class StoreSCPServer:
         for sop_class in self._storage_sop_classes:
             self._ae.add_supported_context(sop_class, TRANSFER_SYNTAXES)
 
-        handlers = [(evt.EVT_C_STORE, self._handle_store)]
+        handlers: list[tuple[Any, Any]] = [
+            (evt.EVT_C_STORE, self._handle_store),
+        ]
+
+        # Issue #6 — wire DicomAssociationSecurity handlers
+        if self._security:
+            handlers.extend(
+                [
+                    (evt.EVT_REQUESTED, self._security.handle_association_request),
+                    (evt.EVT_RELEASED, self._security.handle_association_released),
+                    (evt.EVT_ABORTED, self._security.handle_association_aborted),
+                ]
+            )
+
+        ssl_context = self._build_ssl_context()
         self._ae.start_server(
             (self._bind_address, self.port),
             block=False,
+            ssl_context=ssl_context,
             evt_handlers=handlers,  # type: ignore[arg-type]
         )
         logger.info(
@@ -300,6 +342,7 @@ class StoreSCPServer:
             ae_title=self.ae_title,
             port=self.port,
             sop_classes=len(self._storage_sop_classes),
+            tls_enabled=ssl_context is not None,
         )
 
     def stop(self) -> None:

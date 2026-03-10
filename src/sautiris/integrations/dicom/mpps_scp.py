@@ -5,13 +5,14 @@ step status (IN PROGRESS, COMPLETED, DISCONTINUED).
 
 Issue #14: Implements proper state machine validation:
   - N-CREATE only allowed with status "IN PROGRESS"
-  - N-SET only allowed from "IN PROGRESS" → "COMPLETED" | "DISCONTINUED"
+  - N-SET only allowed from "IN PROGRESS" -> "COMPLETED" | "DISCONTINUED"
   - Invalid transitions return DIMSE status 0x0110
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy
 import threading
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
@@ -23,7 +24,11 @@ from pynetdicom import AE, evt
 from sautiris.models.mpps import MPPSStatusEnum
 
 if TYPE_CHECKING:
+    import ssl  # noqa: F401
+
     from pynetdicom.events import Event
+
+    from sautiris.integrations.dicom.security import DicomAssociationSecurity  # noqa: F401
 
 logger = structlog.get_logger(__name__)
 
@@ -35,14 +40,14 @@ CHARSET_UTF8 = "ISO_IR 192"
 
 # Transfer syntaxes supported by this SCP — Issue #9
 TRANSFER_SYNTAXES: list[str] = [
-    "1.2.840.10008.1.2.1",    # Explicit VR Little Endian
-    "1.2.840.10008.1.2",      # Implicit VR Little Endian
-    "1.2.840.10008.1.2.4.50", # JPEG Baseline (Process 1)
-    "1.2.840.10008.1.2.4.70", # JPEG Lossless (Process 14 SV1)
-    "1.2.840.10008.1.2.4.90", # JPEG 2000 Lossless Only
-    "1.2.840.10008.1.2.4.91", # JPEG 2000
-    "1.2.840.10008.1.2.5",    # RLE Lossless
-    "1.2.840.10008.1.2.1.99", # Deflated Explicit VR Little Endian
+    "1.2.840.10008.1.2.1",  # Explicit VR Little Endian
+    "1.2.840.10008.1.2",  # Implicit VR Little Endian
+    "1.2.840.10008.1.2.4.50",  # JPEG Baseline (Process 1)
+    "1.2.840.10008.1.2.4.70",  # JPEG Lossless (Process 14 SV1)
+    "1.2.840.10008.1.2.4.90",  # JPEG 2000 Lossless Only
+    "1.2.840.10008.1.2.4.91",  # JPEG 2000
+    "1.2.840.10008.1.2.5",  # RLE Lossless
+    "1.2.840.10008.1.2.1.99",  # Deflated Explicit VR Little Endian
 ]
 
 # Issue #14 — valid MPPS status values (use enum for type safety)
@@ -53,6 +58,20 @@ MPPS_STATUS_DISCONTINUED = MPPSStatusEnum.DISCONTINUED
 # Issue #14 — valid target statuses reachable via N-SET from IN PROGRESS
 MPPS_TERMINAL_STATUSES: frozenset[MPPSStatusEnum] = frozenset(
     {MPPSStatusEnum.COMPLETED, MPPSStatusEnum.DISCONTINUED}
+)
+
+# PS3.4 F.7.2 — required Type 1 attributes for N-CREATE
+NCREATE_REQUIRED_ATTRS: tuple[str, ...] = (
+    "PerformedProcedureStepID",
+    "PerformedStationAETitle",
+    "PerformedProcedureStepStartDate",
+    "PerformedProcedureStepStartTime",
+)
+
+# PS3.4 F.7.2 — required Type 1 attributes for N-SET to COMPLETED
+NSET_COMPLETED_REQUIRED_ATTRS: tuple[str, ...] = (
+    "PerformedProcedureStepEndDate",
+    "PerformedProcedureStepEndTime",
 )
 
 
@@ -101,6 +120,26 @@ def _make_mpps_response(dataset: Dataset) -> Dataset:
     return dataset
 
 
+def _validate_required_attrs(
+    dataset: Dataset, required: tuple[str, ...], context: str, sop_uid: str
+) -> bool:
+    """Check that all required DICOM attributes are present and non-empty.
+
+    Returns True if all required attrs are present, False otherwise.
+    """
+    for attr in required:
+        val = getattr(dataset, attr, None)
+        if val is None or str(val).strip() == "":
+            logger.warning(
+                "mpps.missing_required_attr",
+                attr=attr,
+                context=context,
+                sop_instance_uid=sop_uid,
+            )
+            return False
+    return True
+
+
 class MPPSServer:
     """Modality Performed Procedure Step SCP server.
 
@@ -110,7 +149,7 @@ class MPPSServer:
 
     Issue #14: Enforces the MPPS state machine:
     - N-CREATE requires status = "IN PROGRESS" (0x0110 if violated)
-    - N-SET validates current→new transition (0x0110 if invalid)
+    - N-SET validates current->new transition (0x0110 if invalid)
     - Duplicate N-CREATE returns 0x0110
 
     Args:
@@ -120,23 +159,35 @@ class MPPSServer:
             and updates the worklist item.
         loop: The asyncio event loop to run async callbacks on.
         bind_address: IP address to bind to (default ``"127.0.0.1"``).
+        security: Optional DicomAssociationSecurity for AE whitelist/rate/connection limits.
+        tls_cert: Path to TLS certificate file for DICOM TLS.
+        tls_key: Path to TLS private key file for DICOM TLS.
+        tls_ca_cert: Path to CA certificate file for mutual TLS (client verification).
     """
 
     def __init__(
         self,
         ae_title: str = "SAUTIRIS_MPPS",
         port: int = 11113,
-        status_callback: Callable[[str, dict[str, Any]], Coroutine[Any, Any, None]] | None = None,
+        status_callback: (Callable[[str, dict[str, Any]], Coroutine[Any, Any, None]] | None) = None,
         loop: asyncio.AbstractEventLoop | None = None,
         bind_address: str = "127.0.0.1",
+        security: DicomAssociationSecurity | None = None,
+        tls_cert: str = "",
+        tls_key: str = "",
+        tls_ca_cert: str = "",
     ) -> None:
         self.ae_title = ae_title
         self.port = port
         self._status_callback = status_callback
         self._loop = loop
         self._bind_address = bind_address
+        self._security = security
+        self._tls_cert = tls_cert
+        self._tls_key = tls_key
+        self._tls_ca_cert = tls_ca_cert
         self._ae: AE | None = None
-        # In-memory MPPS instance store: SOP Instance UID → Dataset
+        # In-memory MPPS instance store: SOP Instance UID -> Dataset
         # Used for state machine tracking; DB persistence handled via callbacks.
         self._instances: dict[str, Dataset] = {}
         # Mutex for atomic duplicate-check + store in N-CREATE (prevents TOCTOU race)
@@ -161,15 +212,15 @@ class MPPSServer:
         Issue #14 state machine: initial status MUST be IN PROGRESS.
         """
         attr_list = event.attribute_list
-        sop_instance_uid = str(event.request.AffectedSOPInstanceUID)  # type: ignore[union-attr]
+        sop_instance_uid = str(
+            event.request.AffectedSOPInstanceUID  # type: ignore[union-attr]
+        )
 
         logger.info("mpps.n_create", sop_instance_uid=sop_instance_uid)
 
         # Issue #14 — N-CREATE MUST carry status "IN PROGRESS" (validate first,
         # before acquiring lock, since status check has no side effects)
-        requested_status = str(
-            getattr(attr_list, "PerformedProcedureStepStatus", "")
-        ).strip()
+        requested_status = str(getattr(attr_list, "PerformedProcedureStepStatus", "")).strip()
         if requested_status != MPPS_STATUS_IN_PROGRESS:
             logger.warning(
                 "mpps.invalid_initial_status",
@@ -178,12 +229,21 @@ class MPPSServer:
             )
             return 0x0110, None
 
+        # PS3.4 F.7.2 — validate required Type 1 attributes
+        if not _validate_required_attrs(
+            attr_list, NCREATE_REQUIRED_ATTRS, "N-CREATE", sop_instance_uid
+        ):
+            return 0x0110, None
+
         # Atomic duplicate-check + store under lock to prevent TOCTOU race
         # (two concurrent N-CREATEs for the same UID both passing the check
         # before either writes — FIX-6)
         with self._create_lock:
             if sop_instance_uid in self._instances:
-                logger.warning("mpps.duplicate_create", sop_instance_uid=sop_instance_uid)
+                logger.warning(
+                    "mpps.duplicate_create",
+                    sop_instance_uid=sop_instance_uid,
+                )
                 return 0x0110, None
             # Store the instance atomically
             self._instances[sop_instance_uid] = attr_list
@@ -211,7 +271,10 @@ class MPPSServer:
         logger.info("mpps.n_set", sop_instance_uid=sop_instance_uid)
 
         if sop_instance_uid not in self._instances:
-            logger.warning("mpps.unknown_instance", sop_instance_uid=sop_instance_uid)
+            logger.warning(
+                "mpps.unknown_instance",
+                sop_instance_uid=sop_instance_uid,
+            )
             return 0x0110, None
 
         # Issue #14 — validate state machine transition
@@ -233,14 +296,27 @@ class MPPSServer:
             )
             return 0x0110, None
 
-        # Apply modification list to stored dataset
-        stored = self._instances[sop_instance_uid]
-        for elem in mod_list:
-            stored.add(elem)
+        # PS3.4 F.7.2 — COMPLETED requires end date/time
+        if new_status == MPPS_STATUS_COMPLETED and not _validate_required_attrs(
+            mod_list, NSET_COMPLETED_REQUIRED_ATTRS, "N-SET-COMPLETED", sop_instance_uid
+        ):
+            return 0x0110, None
 
-        mpps_data = extract_mpps_data(stored)
+        # Build working copy; mutate _instances only after successful callback
+        # to prevent irrecoverable state if callback fails (HIGH-4 fix)
+
+        stored = self._instances[sop_instance_uid]
+        working = copy.copy(stored)
+        for elem in mod_list:
+            working.add(elem)
+
+        mpps_data = extract_mpps_data(working)
         if not self._invoke_callback(sop_instance_uid, mpps_data):
             return 0xC001, None
+
+        # Commit to in-memory state only after successful DB write
+        for elem in mod_list:
+            stored.add(elem)
 
         response = _make_mpps_response(Dataset())
         return 0x0000, response
@@ -262,22 +338,70 @@ class MPPSServer:
                 return False
         return True
 
+    def _build_ssl_context(self) -> ssl.SSLContext | None:
+        """Build an SSL context from TLS cert/key/CA parameters.
+
+        Returns None if TLS is not configured (no cert+key provided).
+        """
+        if not (self._tls_cert and self._tls_key):
+            return None
+        import ssl
+
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(certfile=self._tls_cert, keyfile=self._tls_key)
+        if self._tls_ca_cert:
+            ctx.load_verify_locations(cafile=self._tls_ca_cert)
+            ctx.verify_mode = ssl.CERT_REQUIRED
+        return ctx
+
+    def preload_active_instances(self, instances: dict[str, Dataset]) -> None:
+        """Preload active MPPS instances from the database on startup.
+
+        This enables recovery after a server restart: any IN PROGRESS
+        instances that were previously tracked can be re-loaded so that
+        subsequent N-SET requests succeed.
+
+        Args:
+            instances: Mapping of SOP Instance UID -> Dataset with at least
+                PerformedProcedureStepStatus set.
+        """
+        self._instances.update(instances)
+
     def start(self) -> None:
         """Start the MPPS SCP in non-blocking mode."""
         self._ae = AE(ae_title=self.ae_title)
         # Issue #9 — register with all 8 supported transfer syntaxes
         self._ae.add_supported_context(MPPS_SOP_CLASS, TRANSFER_SYNTAXES)
 
-        handlers = [
+        handlers: list[tuple[Any, Any]] = [
             (evt.EVT_N_CREATE, self._handle_n_create),
             (evt.EVT_N_SET, self._handle_n_set),
         ]
+
+        # Issue #6 — wire DicomAssociationSecurity handlers
+        if self._security:
+            handlers.extend(
+                [
+                    (evt.EVT_REQUESTED, self._security.handle_association_request),
+                    (evt.EVT_RELEASED, self._security.handle_association_released),
+                    (evt.EVT_ABORTED, self._security.handle_association_aborted),
+                ]
+            )
+
+        ssl_context = self._build_ssl_context()
         self._ae.start_server(
             (self._bind_address, self.port),
             block=False,
+            ssl_context=ssl_context,
             evt_handlers=handlers,  # type: ignore[arg-type]
         )
-        logger.info("mpps.server_started", ae_title=self.ae_title, port=self.port)
+        logger.info(
+            "mpps.server_started",
+            ae_title=self.ae_title,
+            port=self.port,
+            tls_enabled=ssl_context is not None,
+        )
 
     def stop(self) -> None:
         """Stop the MPPS SCP."""

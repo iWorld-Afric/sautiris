@@ -94,7 +94,12 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if any(path.endswith(s) for s in _HEALTH_SUFFIXES) or path == "/":
             return await call_next(request)
 
-        client_ip = request.client.host if request.client else "unknown"
+        if request.client is None:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Unable to determine client address"},
+            )
+        client_ip = request.client.host
         if client_ip in self._settings.rate_limit_trusted_ips:
             return await call_next(request)
 

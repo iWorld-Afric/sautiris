@@ -211,15 +211,45 @@ class ScheduleService:
         return list(conflicts)
 
     async def _emit(self, event_type: str, slot: ScheduleSlot) -> None:
-        await self._publish(
-            DomainEvent(
-                event_type=event_type,
-                payload={
-                    "slot_id": str(slot.id),
-                    "order_id": str(slot.order_id),
-                    "room_id": slot.room_id,
-                    "status": slot.status,
-                },
-                tenant_id=get_current_tenant_id(),
-            )
+        from sautiris.core.events import (  # noqa: PLC0415
+            ScheduleSlotCreated,
+            ScheduleSlotUpdated,
         )
+
+        tenant_id = get_current_tenant_id()
+
+        if event_type == "schedule.slot_created":
+            await self._publish(
+                ScheduleSlotCreated(
+                    slot_id=str(slot.id),
+                    order_id=str(slot.order_id),
+                    room_id=slot.room_id,
+                    modality=slot.modality,
+                    status=slot.status,
+                    tenant_id=tenant_id,
+                )
+            )
+        elif event_type == "schedule.slot_updated":
+            await self._publish(
+                ScheduleSlotUpdated(
+                    slot_id=str(slot.id),
+                    order_id=str(slot.order_id),
+                    room_id=slot.room_id,
+                    modality=slot.modality,
+                    status=slot.status,
+                    tenant_id=tenant_id,
+                )
+            )
+        else:
+            await self._publish(
+                DomainEvent(
+                    event_type=event_type,
+                    payload={
+                        "slot_id": str(slot.id),
+                        "order_id": str(slot.order_id),
+                        "room_id": slot.room_id,
+                        "status": slot.status,
+                    },
+                    tenant_id=tenant_id,
+                )
+            )

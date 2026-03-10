@@ -71,7 +71,7 @@ def require_permission(permission: str) -> Callable[..., Coroutine[Any, Any, Aut
         if not has_permission(user.roles, Permission(permission)):
             raise HTTPException(
                 status_code=403,
-                detail=f"Missing permission: {permission}",
+                detail="Insufficient permissions",
             )
         return user
 
