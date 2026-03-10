@@ -92,6 +92,14 @@ class OAuth2AuthProvider(AuthProvider):
                 resp.raise_for_status()
             except httpx.HTTPError as exc:
                 logger.error("jwks.fetch_failed", url=self.jwks_url, error=str(exc))
+                # SEC-2: Return stale cache if available — only raise 503 on cold start
+                if self._jwks_cache is not None:
+                    logger.warning(
+                        "jwks.using_stale_cache",
+                        url=self.jwks_url,
+                        cache_age_seconds=round(now - self._cache_time, 1),
+                    )
+                    return self._jwks_cache
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail="Authentication service unavailable",

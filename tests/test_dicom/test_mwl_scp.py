@@ -274,11 +274,41 @@ class TestIssue3RequiredTags:
         ds = worklist_item_to_dataset(item)
         assert ds.PregnancyStatus == 2
 
-    def test_pregnancy_status_absent_when_none(self) -> None:
+    def test_pregnancy_status_present_when_none(self) -> None:
+        """Type 2: PregnancyStatus MUST be present even when None (zero-length allowed)."""
         item = _make_worklist_item(study_instance_uid=None)
         ds = worklist_item_to_dataset(item)
-        # Not set when None — no attribute
-        assert not hasattr(ds, "PregnancyStatus")
+        assert hasattr(ds, "PregnancyStatus")
+        assert ds.PregnancyStatus == ""
+
+    def test_scheduled_protocol_code_sequence_present(self) -> None:
+        """Type 2: ScheduledProtocolCodeSequence (0040,0008) must be present."""
+        item = _make_worklist_item()
+        ds = worklist_item_to_dataset(item)
+        sps = ds.ScheduledProcedureStepSequence[0]
+        assert hasattr(sps, "ScheduledProtocolCodeSequence")
+        assert len(sps.ScheduledProtocolCodeSequence) == 0
+
+    def test_referenced_patient_sequence_present(self) -> None:
+        """Type 2: ReferencedPatientSequence (0008,1120) must be present."""
+        item = _make_worklist_item()
+        ds = worklist_item_to_dataset(item)
+        assert hasattr(ds, "ReferencedPatientSequence")
+        assert len(ds.ReferencedPatientSequence) == 0
+
+    def test_admission_id_present(self) -> None:
+        """Type 2: AdmissionID (0038,0010) must be present."""
+        item = _make_worklist_item()
+        ds = worklist_item_to_dataset(item)
+        assert hasattr(ds, "AdmissionID")
+        assert ds.AdmissionID == ""
+
+    def test_issuer_of_patient_id_present(self) -> None:
+        """Type 2: IssuerOfPatientID (0010,0021) must be present."""
+        item = _make_worklist_item()
+        ds = worklist_item_to_dataset(item)
+        assert hasattr(ds, "IssuerOfPatientID")
+        assert ds.IssuerOfPatientID == ""
 
 
 class TestIssue3QueryFilters:
@@ -573,3 +603,35 @@ class TestOpenEndedDateRanges:
         filters = extract_query_filters(ds)
         assert "date_from" not in filters
         assert filters["date_to"] == date(2026, 3, 5)
+
+
+# ---------------------------------------------------------------------------
+# StudyInstanceUID persistence — same UID across repeated queries
+# ---------------------------------------------------------------------------
+
+
+class TestStudyInstanceUIDPersistence:
+    """Verify that a persisted study_instance_uid is returned consistently."""
+
+    def test_persisted_uid_returned_on_repeated_calls(self) -> None:
+        """Same worklist item must return same StudyInstanceUID every time."""
+        uid = "1.2.826.0.1.3680043.9.7539.99.1"
+        item = _make_worklist_item(study_instance_uid=uid)
+        ds1 = worklist_item_to_dataset(item)
+        ds2 = worklist_item_to_dataset(item)
+        assert str(ds1.StudyInstanceUID) == uid
+        assert str(ds2.StudyInstanceUID) == uid
+
+    def test_none_uid_generates_uid_each_call(self) -> None:
+        """Legacy items without persisted UID still get a generated UID."""
+        item = _make_worklist_item(study_instance_uid=None)
+        ds = worklist_item_to_dataset(item)
+        uid = str(ds.StudyInstanceUID)
+        assert uid and "." in uid  # valid DICOM UID format
+
+    def test_empty_string_uid_generates_new_uid(self) -> None:
+        """Empty string UID should be treated as absent and generate a new one."""
+        item = _make_worklist_item(study_instance_uid="")
+        ds = worklist_item_to_dataset(item)
+        uid = str(ds.StudyInstanceUID)
+        assert uid and uid != ""  # should be a generated UID, not empty

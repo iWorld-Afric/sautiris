@@ -11,11 +11,14 @@ unchanged (suitable for development).  Run with the env var set in staging/prod.
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Sequence
 
 from alembic import op
 from sqlalchemy import text
+
+logger = logging.getLogger(__name__)
 
 revision: str = "ris003"
 down_revision: str | None = "ris002"
@@ -37,6 +40,7 @@ def upgrade() -> None:
 
     fernet = Fernet(raw_key.encode())
     conn = op.get_bind()
+    encrypted_count = 0
 
     # --- Encrypt pacs_connections.password ---
     pacs_rows = conn.execute(
@@ -49,6 +53,7 @@ def upgrade() -> None:
                 text("UPDATE pacs_connections SET password = :p WHERE id = :id"),
                 {"p": encrypted, "id": str(row_id)},
             )
+            encrypted_count += 1
 
     # --- Encrypt ai_provider_configs.api_key and .webhook_secret ---
     ai_rows = conn.execute(
@@ -72,6 +77,9 @@ def upgrade() -> None:
                 ),
                 updates,
             )
+            encrypted_count += 1
+
+    logger.info("ris003: encrypted %d credential records", encrypted_count)
 
 
 def downgrade() -> None:

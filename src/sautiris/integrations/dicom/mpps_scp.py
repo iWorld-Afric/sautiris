@@ -21,6 +21,7 @@ import structlog
 from pydicom.dataset import Dataset
 from pynetdicom import AE, evt
 
+from sautiris.integrations.dicom.constants import CHARSET_UTF8, DEFAULT_TRANSFER_SYNTAXES
 from sautiris.models.mpps import MPPSStatusEnum
 
 if TYPE_CHECKING:
@@ -35,20 +36,8 @@ logger = structlog.get_logger(__name__)
 # MPPS SOP Class UID
 MPPS_SOP_CLASS = "1.2.840.10008.3.1.2.3.3"
 
-# SpecificCharacterSet for UTF-8 (ISO_IR 192) — Issue #5
-CHARSET_UTF8 = "ISO_IR 192"
-
-# Transfer syntaxes supported by this SCP — Issue #9
-TRANSFER_SYNTAXES: list[str] = [
-    "1.2.840.10008.1.2.1",  # Explicit VR Little Endian
-    "1.2.840.10008.1.2",  # Implicit VR Little Endian
-    "1.2.840.10008.1.2.4.50",  # JPEG Baseline (Process 1)
-    "1.2.840.10008.1.2.4.70",  # JPEG Lossless (Process 14 SV1)
-    "1.2.840.10008.1.2.4.90",  # JPEG 2000 Lossless Only
-    "1.2.840.10008.1.2.4.91",  # JPEG 2000
-    "1.2.840.10008.1.2.5",  # RLE Lossless
-    "1.2.840.10008.1.2.1.99",  # Deflated Explicit VR Little Endian
-]
+# Re-exported for backwards compatibility (imported from constants.py)
+TRANSFER_SYNTAXES = DEFAULT_TRANSFER_SYNTAXES
 
 # Issue #14 — valid MPPS status values (use enum for type safety)
 MPPS_STATUS_IN_PROGRESS = MPPSStatusEnum.IN_PROGRESS
@@ -72,6 +61,13 @@ NCREATE_REQUIRED_ATTRS: tuple[str, ...] = (
 NSET_COMPLETED_REQUIRED_ATTRS: tuple[str, ...] = (
     "PerformedProcedureStepEndDate",
     "PerformedProcedureStepEndTime",
+)
+
+# PS3.4 F.7.2 — required Type 1 attributes for N-SET to DISCONTINUED
+NSET_DISCONTINUED_REQUIRED_ATTRS: tuple[str, ...] = (
+    "PerformedProcedureStepEndDate",
+    "PerformedProcedureStepEndTime",
+    "PerformedProcedureStepDiscontinuationReasonCodeSequence",
 )
 
 
@@ -244,7 +240,7 @@ class MPPSServer:
                     "mpps.duplicate_create",
                     sop_instance_uid=sop_instance_uid,
                 )
-                return 0x0110, None
+                return 0x0111, None
             # Store the instance atomically
             self._instances[sop_instance_uid] = attr_list
 
@@ -301,6 +297,26 @@ class MPPSServer:
             mod_list, NSET_COMPLETED_REQUIRED_ATTRS, "N-SET-COMPLETED", sop_instance_uid
         ):
             return 0x0110, None
+
+        # PS3.4 F.7.2 — DISCONTINUED requires end date/time AND discontinuation reason
+        if new_status == MPPS_STATUS_DISCONTINUED:
+            if not _validate_required_attrs(
+                mod_list,
+                NSET_DISCONTINUED_REQUIRED_ATTRS,
+                "N-SET-DISCONTINUED",
+                sop_instance_uid,
+            ):
+                return 0x0110, None
+            # DiscontinuationReasonCodeSequence must have at least one item
+            reason_seq = getattr(
+                mod_list, "PerformedProcedureStepDiscontinuationReasonCodeSequence", None
+            )
+            if reason_seq is not None and len(reason_seq) == 0:
+                logger.warning(
+                    "mpps.empty_discontinuation_reason_seq",
+                    sop_instance_uid=sop_instance_uid,
+                )
+                return 0x0110, None
 
         # Build working copy; mutate _instances only after successful callback
         # to prevent irrecoverable state if callback fails (HIGH-4 fix)

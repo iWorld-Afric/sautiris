@@ -52,6 +52,7 @@ class WorklistItem(TenantAwareBase):
     status: Mapped[WorklistStatus] = mapped_column(String(32), default=WorklistStatus.SCHEDULED)
     mpps_status: Mapped[MPPSStatus | None] = mapped_column(String(32), default=None)
     mpps_uid: Mapped[str | None] = mapped_column(String(128), default=None)
+    study_instance_uid: Mapped[str | None] = mapped_column(String(128), default=None)
     scheduled_performing_physician_name: Mapped[str | None] = mapped_column(
         String(255), default=None
     )

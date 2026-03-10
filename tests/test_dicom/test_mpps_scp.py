@@ -151,11 +151,22 @@ def _make_n_create_event(sop_uid: str, status: str = "IN PROGRESS") -> MagicMock
 
 def _make_n_set_event(sop_uid: str, new_status: str) -> MagicMock:
     """Build a mock pynetdicom EVT_N_SET event."""
+    from pydicom.sequence import Sequence as DicomSeq
+
     mod_list = Dataset()
     mod_list.PerformedProcedureStepStatus = new_status
     if new_status in ("COMPLETED", MPPSStatusEnum.COMPLETED):
         mod_list.PerformedProcedureStepEndDate = "20260310"
         mod_list.PerformedProcedureStepEndTime = "160000"
+    elif new_status in ("DISCONTINUED", MPPSStatusEnum.DISCONTINUED):
+        mod_list.PerformedProcedureStepEndDate = "20260310"
+        mod_list.PerformedProcedureStepEndTime = "160000"
+        # PS3.4 F.7.2 — DiscontinuationReasonCodeSequence required
+        reason_item = Dataset()
+        reason_item.CodeValue = "110514"
+        reason_item.CodingSchemeDesignator = "DCM"
+        reason_item.CodeMeaning = "Equipment failure"
+        mod_list.PerformedProcedureStepDiscontinuationReasonCodeSequence = DicomSeq([reason_item])
     request = MagicMock()
     request.RequestedSOPInstanceUID = sop_uid
     event = MagicMock()
@@ -184,13 +195,13 @@ class TestIssue14MPPSStateMachine:
         assert "1.2.3.4.2" not in server._instances
 
     def test_n_create_duplicate_rejected(self) -> None:
-        """Duplicate N-CREATE for existing UID must return 0x0110."""
+        """Duplicate N-CREATE for existing UID must return 0x0111."""
         server = MPPSServer()
         uid = "1.2.3.4.3"
         event = _make_n_create_event(uid, MPPS_STATUS_IN_PROGRESS)
         server._handle_n_create(event)  # first create — OK
         status, ds = server._handle_n_create(event)  # duplicate
-        assert status == 0x0110
+        assert status == 0x0111
         assert ds is None
 
     def test_n_set_to_completed_succeeds(self) -> None:
@@ -472,13 +483,69 @@ class TestIssue14RequiredAttributes:
         assert status == 0x0000
         assert ds is not None
 
-    def test_n_set_discontinued_no_end_date_required(self) -> None:
-        """DISCONTINUED does not require end date/time per PS3.4 F.7.2."""
+    def test_n_set_discontinued_missing_end_date_rejected(self) -> None:
+        """PS3.4 F.7.2: DISCONTINUED requires end date/time — reject if missing."""
         server = MPPSServer()
         server._handle_n_create(_make_n_create_event("1.2.3.attr.6", MPPS_STATUS_IN_PROGRESS))
-        event = _make_n_set_event("1.2.3.attr.6", MPPS_STATUS_DISCONTINUED)
+        # Manually build N-SET without end date/time
+        mod_list = Dataset()
+        mod_list.PerformedProcedureStepStatus = "DISCONTINUED"
+        # Missing: PerformedProcedureStepEndDate, EndTime, DiscontinuationReason
+        request = MagicMock()
+        request.RequestedSOPInstanceUID = "1.2.3.attr.6"
+        event = MagicMock()
+        event.modification_list = mod_list
+        event.request = request
+        status, ds = server._handle_n_set(event)
+        assert status == 0x0110
+        assert ds is None
+
+    def test_n_set_discontinued_missing_reason_seq_rejected(self) -> None:
+        """PS3.4 F.7.2: DISCONTINUED requires DiscontinuationReasonCodeSequence."""
+        server = MPPSServer()
+        server._handle_n_create(_make_n_create_event("1.2.3.attr.7", MPPS_STATUS_IN_PROGRESS))
+        mod_list = Dataset()
+        mod_list.PerformedProcedureStepStatus = "DISCONTINUED"
+        mod_list.PerformedProcedureStepEndDate = "20260310"
+        mod_list.PerformedProcedureStepEndTime = "160000"
+        # Missing: PerformedProcedureStepDiscontinuationReasonCodeSequence
+        request = MagicMock()
+        request.RequestedSOPInstanceUID = "1.2.3.attr.7"
+        event = MagicMock()
+        event.modification_list = mod_list
+        event.request = request
+        status, ds = server._handle_n_set(event)
+        assert status == 0x0110
+        assert ds is None
+
+    def test_n_set_discontinued_empty_reason_seq_rejected(self) -> None:
+        """PS3.4 F.7.2: empty DiscontinuationReasonCodeSequence is invalid."""
+        from pydicom.sequence import Sequence as DicomSeq
+
+        server = MPPSServer()
+        server._handle_n_create(_make_n_create_event("1.2.3.attr.8", MPPS_STATUS_IN_PROGRESS))
+        mod_list = Dataset()
+        mod_list.PerformedProcedureStepStatus = "DISCONTINUED"
+        mod_list.PerformedProcedureStepEndDate = "20260310"
+        mod_list.PerformedProcedureStepEndTime = "160000"
+        mod_list.PerformedProcedureStepDiscontinuationReasonCodeSequence = DicomSeq()  # empty
+        request = MagicMock()
+        request.RequestedSOPInstanceUID = "1.2.3.attr.8"
+        event = MagicMock()
+        event.modification_list = mod_list
+        event.request = request
+        status, ds = server._handle_n_set(event)
+        assert status == 0x0110
+        assert ds is None
+
+    def test_n_set_discontinued_with_all_required_succeeds(self) -> None:
+        """PS3.4 F.7.2: DISCONTINUED with end date/time and reason succeeds."""
+        server = MPPSServer()
+        server._handle_n_create(_make_n_create_event("1.2.3.attr.9", MPPS_STATUS_IN_PROGRESS))
+        event = _make_n_set_event("1.2.3.attr.9", MPPS_STATUS_DISCONTINUED)
         status, ds = server._handle_n_set(event)
         assert status == 0x0000
+        assert ds is not None
 
 
 class TestPreloadActiveInstances:
@@ -575,14 +642,14 @@ class TestPreloadEdgeCases:
     """GAP-5: preload_active_instances overwrite and terminal-state behavior."""
 
     def test_preloaded_uid_blocks_duplicate_n_create(self) -> None:
-        """Preloaded UID should block N-CREATE (duplicate detection)."""
+        """Preloaded UID should block N-CREATE (duplicate detection — 0x0111)."""
         server = MPPSServer()
         ds = Dataset()
         ds.PerformedProcedureStepStatus = "IN PROGRESS"
         server.preload_active_instances({"1.2.3.gap5.1": ds})
         event = _make_n_create_event("1.2.3.gap5.1", MPPS_STATUS_IN_PROGRESS)
         status, _ = server._handle_n_create(event)
-        assert status == 0x0110
+        assert status == 0x0111
 
     def test_preloaded_terminal_state_blocks_n_set(self) -> None:
         """Preloaded COMPLETED instance should block N-SET (terminal state)."""

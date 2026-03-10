@@ -77,6 +77,8 @@ class WorklistService:
         requested_procedure_description: str | None = None,
         referring_physician_name: str | None = None,
     ) -> WorklistItem:
+        from pydicom.uid import generate_uid  # noqa: PLC0415
+
         item = WorklistItem(
             order_id=order_id,
             schedule_slot_id=schedule_slot_id,
@@ -93,6 +95,7 @@ class WorklistService:
             requested_procedure_id=requested_procedure_id,
             requested_procedure_description=requested_procedure_description,
             referring_physician_name=referring_physician_name,
+            study_instance_uid=generate_uid(),
             status=WorklistStatus.SCHEDULED,
         )
         created = await self.repo.create(item)

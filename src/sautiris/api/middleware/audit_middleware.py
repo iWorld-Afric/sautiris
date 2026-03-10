@@ -29,6 +29,11 @@ PHI_ROUTE_PREFIXES: tuple[str, ...] = (
     "/api/v1/reports",
     "/api/v1/patients",
     "/api/v1/worklist",
+    # SEC-4: Additional PHI routes that were missing from audit coverage
+    "/api/v1/alerts",
+    "/api/v1/dose",
+    "/api/v1/billing",
+    "/api/v1/peer-review",
 )
 
 # FIX-10: Allowlist pattern for client-provided correlation IDs

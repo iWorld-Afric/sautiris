@@ -45,8 +45,21 @@ class TestIsPhiRoute:
     def test_health_not_phi(self) -> None:
         assert _is_phi_route("/api/v1/health") is False
 
-    def test_alerts_not_phi(self) -> None:
-        assert _is_phi_route("/api/v1/alerts") is False
+    # SEC-4: New PHI route prefixes
+    def test_alerts_is_phi(self) -> None:
+        assert _is_phi_route("/api/v1/alerts") is True
+
+    def test_dose_is_phi(self) -> None:
+        assert _is_phi_route("/api/v1/dose") is True
+
+    def test_billing_is_phi(self) -> None:
+        assert _is_phi_route("/api/v1/billing") is True
+
+    def test_peer_review_is_phi(self) -> None:
+        assert _is_phi_route("/api/v1/peer-review") is True
+
+    def test_peer_review_with_id_is_phi(self) -> None:
+        assert _is_phi_route("/api/v1/peer-review/abc-123") is True
 
     def test_root_not_phi(self) -> None:
         assert _is_phi_route("/") is False

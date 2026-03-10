@@ -160,6 +160,8 @@ Each response dataset includes the following attributes (DICOM PS3.4 Annex K):
 **Type 2 (Required, may be empty):**
 - PatientName, PatientID, PatientBirthDate, PatientSex
 - PatientWeight, MedicalAlerts, Allergies, PregnancyStatus
+- IssuerOfPatientID (0010,0021), AdmissionID (0038,0010)
+- ReferencedPatientSequence (0008,1120)
 - AccessionNumber, ReferringPhysicianName
 - RequestedProcedureID, RequestedProcedureDescription
 - RequestedProcedurePriority
@@ -171,6 +173,7 @@ Each response dataset includes the following attributes (DICOM PS3.4 Annex K):
   - ScheduledProcedureStepID, ScheduledProcedureStepDescription
   - ScheduledProcedureStepStatus
   - ScheduledPerformingPhysicianName
+  - ScheduledProtocolCodeSequence (0040,0008)
 
 **SpecificCharacterSet**: `ISO_IR 192` (UTF-8) is set on all outbound datasets.
 
@@ -202,7 +205,7 @@ Same 8 transfer syntaxes as MWL SCP (see Section 5.1.2).
 Constraints:
   - N-CREATE MUST set PerformedProcedureStepStatus = "IN PROGRESS"
     (any other value → 0x0110 Attribute Value Out of Range)
-  - Duplicate N-CREATE for existing SOP Instance UID → 0x0110
+  - Duplicate N-CREATE for existing SOP Instance UID → 0x0111
   - N-SET from terminal state → 0x0110
   - N-SET with target status other than COMPLETED/DISCONTINUED → 0x0110
 
@@ -211,6 +214,8 @@ Type 1 Attribute Validation (PS3.4 F.7.2):
     PerformedProcedureStepStartDate, PerformedProcedureStepStartTime
   - N-SET to COMPLETED requires: PerformedProcedureStepEndDate,
     PerformedProcedureStepEndTime
+  - N-SET to DISCONTINUED requires: PerformedProcedureStepEndDate,
+    PerformedProcedureStepEndTime, PerformedProcedureStepDiscontinuationReasonCodeSequence
   - Missing required attributes → 0x0110
 
 Persistence:
@@ -227,7 +232,7 @@ MPPS instances are persisted to the `mpps_instances` table (PostgreSQL).
 
 **Role**: Service Class Provider (SCP)
 
-#### 5.3.1 Supported SOP Classes (30 classes)
+#### 5.3.1 Supported SOP Classes (29 classes)
 
 | SOP Class                                   | SOP Class UID                     |
 |---------------------------------------------|-----------------------------------|
@@ -312,8 +317,6 @@ service provider per PS3.8.
 | `SAUTIRIS_DICOM_TLS_KEY`             | `""`                | Server key path           |
 | `SAUTIRIS_ENABLE_DICOM_MWL`          | `true`              | Enable MWL SCP            |
 | `SAUTIRIS_ENABLE_DICOM_MPPS`         | `true`              | Enable MPPS SCP           |
-| `SAUTIRIS_DICOM_TRANSFER_SYNTAXES`   | `(unset = 8 defaults)` | Custom transfer syntax UIDs |
-| `SAUTIRIS_DICOM_STORE_SOP_CLASSES`   | `(unset = 30 defaults)`| Custom Storage SOP classes  |
 
 ---
 

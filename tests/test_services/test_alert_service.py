@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sautiris.core.events import CriticalFinding, EventBus
 from sautiris.models.alert import AlertType, AlertUrgency, CriticalAlert, NotificationMethod
 from sautiris.services.alert_service import AlertService
 from tests.conftest import TEST_USER_ID, make_order
@@ -293,3 +294,111 @@ class TestAlertServiceDispatchFailures:
                     order_id=order.id,  # type: ignore[union-attr]
                     alert_type=AlertType.CRITICAL_FINDING,
                 )
+
+
+# ---------------------------------------------------------------------------
+# EventBus integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestAlertServiceEventBus:
+    """CriticalFinding event emission via EventBus."""
+
+    async def test_critical_finding_event_emitted(
+        self, db_session: AsyncSession, order: object
+    ) -> None:
+        """CriticalFinding event is published when alert_type is CRITICAL_FINDING."""
+        bus = EventBus()
+        received: list[CriticalFinding] = []
+
+        async def handler(event: CriticalFinding) -> None:  # type: ignore[type-arg]
+            received.append(event)
+
+        bus.subscribe("finding.critical", handler)
+
+        svc = AlertService(db_session, event_bus=bus)
+        alert = await svc.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.CRITICAL_FINDING,
+            finding_description="Pneumothorax detected",
+            urgency=AlertUrgency.IMMEDIATE,
+        )
+
+        assert len(received) == 1
+        evt = received[0]
+        assert evt.event_type == "finding.critical"
+        assert evt.order_id == str(order.id)  # type: ignore[union-attr]
+        assert evt.alert_id == str(alert.id)
+        assert evt.finding_description == "Pneumothorax detected"
+        assert evt.urgency == "IMMEDIATE"
+
+    async def test_no_event_for_non_critical_alert(
+        self, db_session: AsyncSession, order: object
+    ) -> None:
+        """No CriticalFinding event for non-CRITICAL_FINDING alert types."""
+        bus = EventBus()
+        received: list[CriticalFinding] = []
+
+        async def handler(event: CriticalFinding) -> None:  # type: ignore[type-arg]
+            received.append(event)
+
+        bus.subscribe("finding.critical", handler)
+
+        svc = AlertService(db_session, event_bus=bus)
+        await svc.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.INCIDENTAL,
+            finding_description="Benign cyst noted",
+            urgency=AlertUrgency.NON_URGENT,
+        )
+
+        assert len(received) == 0
+
+    async def test_no_event_for_unexpected_finding(
+        self, db_session: AsyncSession, order: object
+    ) -> None:
+        """No CriticalFinding event for UNEXPECTED_FINDING alert type."""
+        bus = EventBus()
+        received: list[CriticalFinding] = []
+
+        async def handler(event: CriticalFinding) -> None:  # type: ignore[type-arg]
+            received.append(event)
+
+        bus.subscribe("finding.critical", handler)
+
+        svc = AlertService(db_session, event_bus=bus)
+        await svc.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.UNEXPECTED_FINDING,
+        )
+
+        assert len(received) == 0
+
+    async def test_event_bus_handler_error_does_not_break_alert(
+        self, db_session: AsyncSession, order: object
+    ) -> None:
+        """If an event handler raises, the alert is still created successfully."""
+        bus = EventBus()
+
+        async def failing_handler(event: CriticalFinding) -> None:  # type: ignore[type-arg]
+            raise RuntimeError("handler crashed")
+
+        bus.subscribe("finding.critical", failing_handler)
+
+        svc = AlertService(db_session, event_bus=bus)
+        alert = await svc.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.CRITICAL_FINDING,
+            finding_description="Tension pneumothorax",
+        )
+        # Alert still persisted despite handler failure
+        assert alert.id is not None
+
+    async def test_no_event_bus_still_works(self, db_session: AsyncSession, order: object) -> None:
+        """AlertService without event_bus works as before (backward compat)."""
+        svc = AlertService(db_session)
+        alert = await svc.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.CRITICAL_FINDING,
+        )
+        assert alert.id is not None

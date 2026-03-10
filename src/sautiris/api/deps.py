@@ -43,6 +43,22 @@ async def get_current_user(request: Request) -> AuthUser:
     user = await auth_provider.get_current_user(request)
     # Issue #1: ContextVar is set from JWT only — never from request header
     set_current_tenant_id(user.tenant_id)
+
+    # SEC-1: Reject X-Tenant-ID header when it doesn't match the JWT tenant.
+    # A mismatch signals either an attack (tenant spoofing) or misconfiguration.
+    header_tenant = request.headers.get("X-Tenant-ID")
+    if header_tenant is not None and header_tenant != str(user.tenant_id):
+        logger.warning(
+            "auth.tenant_id_mismatch",
+            header_tenant_id=header_tenant,
+            jwt_tenant_id=str(user.tenant_id),
+            user_id=str(user.user_id),
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="X-Tenant-ID header does not match authenticated tenant",
+        )
+
     # FIX-2: Write user to request.state so AuditMiddleware can read it
     request.state.user = user
     return user
@@ -68,7 +84,13 @@ def require_permission(permission: str) -> Callable[..., Coroutine[Any, Any, Aut
     from sautiris.core.permissions import Permission, has_permission  # noqa: PLC0415
 
     async def _check(user: AuthUser = Depends(get_current_user)) -> AuthUser:
-        if not has_permission(user.roles, Permission(permission)):
+        # SEC-3: Check both role-based AND explicit permissions.
+        # API key users have permissions populated directly (not via roles),
+        # so the roles-only check would always reject them.
+        if (
+            not has_permission(user.roles, Permission(permission))
+            and permission not in user.permissions
+        ):
             raise HTTPException(
                 status_code=403,
                 detail="Insufficient permissions",

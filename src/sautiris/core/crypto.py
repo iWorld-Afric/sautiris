@@ -12,12 +12,15 @@ Key generation:
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from cryptography.fernet import InvalidToken
 from sqlalchemy import String
 from sqlalchemy.types import TypeDecorator
+
+if TYPE_CHECKING:
+    from sqlalchemy.engine import Connection
 
 logger = structlog.get_logger(__name__)
 
@@ -99,3 +102,56 @@ class EncryptedString(TypeDecorator[str]):
                 ),
             )
             return value
+
+
+# Fernet-encrypted values always start with "gAAAAAB"
+_FERNET_PREFIX = "gAAAAAB"
+
+# Tables and columns that use EncryptedString
+_ENCRYPTED_COLUMNS: tuple[tuple[str, list[str]], ...] = (
+    ("pacs_connections", ["password"]),
+    ("ai_provider_configs", ["api_key", "webhook_secret"]),
+)
+
+
+def rotate_encryption_key(
+    conn: Connection,
+    old_key: str,
+    new_key: str,
+) -> int:
+    """Re-encrypt all credential columns from *old_key* to *new_key*.
+
+    Operates within the caller's transaction — the caller is responsible
+    for committing or rolling back.
+
+    Returns the number of values re-encrypted.
+    """
+    from cryptography.fernet import Fernet  # noqa: PLC0415
+    from sqlalchemy import text  # noqa: PLC0415
+
+    old_fernet = Fernet(old_key.encode())
+    new_fernet = Fernet(new_key.encode())
+    rotated = 0
+
+    for table, columns in _ENCRYPTED_COLUMNS:
+        col_list = ", ".join(["id", *columns])
+        rows = conn.execute(text(f"SELECT {col_list} FROM {table}")).fetchall()  # noqa: S608
+        for row in rows:
+            row_id = row[0]
+            updates: dict[str, str] = {}
+            for i, col in enumerate(columns, start=1):
+                value = row[i]
+                if value and str(value).startswith(_FERNET_PREFIX):
+                    plaintext = old_fernet.decrypt(str(value).encode()).decode()
+                    updates[col] = new_fernet.encrypt(plaintext.encode()).decode()
+            if updates:
+                rotated += len(updates)
+                set_clause = ", ".join(f"{k} = :{k}" for k in updates)
+                updates["id"] = str(row_id)
+                conn.execute(
+                    text(f"UPDATE {table} SET {set_clause} WHERE id = :id"),  # noqa: S608
+                    updates,
+                )
+
+    logger.info("crypto.key_rotation_complete", rotated_values=rotated)
+    return rotated

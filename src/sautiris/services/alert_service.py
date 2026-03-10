@@ -9,6 +9,7 @@ from typing import Any, Literal, Protocol
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sautiris.core.events import CriticalFinding, DomainEvent, EventBus
 from sautiris.core.tenancy import get_current_tenant_id
 from sautiris.models.alert import AlertType, AlertUrgency, CriticalAlert, NotificationMethod
 from sautiris.repositories.alert import AlertRepository
@@ -62,13 +63,37 @@ class AlertService:
         self,
         session: AsyncSession,
         *,
+        event_bus: EventBus | None = None,
         notification_dispatcher: NotificationDispatcher | None = None,
         escalation_timeout_minutes: int = DEFAULT_ESCALATION_TIMEOUT,
     ) -> None:
         self.session = session
         self.repo = AlertRepository(session)
+        self._event_bus = event_bus
         self.dispatcher = notification_dispatcher or LoggingNotificationDispatcher()
         self.escalation_timeout = escalation_timeout_minutes
+
+    async def _publish(self, event: DomainEvent) -> None:
+        """Publish a domain event if an event bus is configured."""
+        if self._event_bus is not None:
+            errors = await self._event_bus.publish(event)
+            if errors:
+                for exc in errors:
+                    logger.error(
+                        "event_bus.handler_error",
+                        event_type=event.event_type,
+                        error=str(exc),
+                    )
+                if isinstance(event, CriticalFinding):
+                    logger.critical(
+                        "event_bus.critical_finding_handlers_failed",
+                        event_type=event.event_type,
+                        error_count=len(errors),
+                        msg=(
+                            "CriticalFinding handlers failed — patient safety event "
+                            "may not have been delivered"
+                        ),
+                    )
 
     async def create_alert(
         self,
@@ -121,6 +146,22 @@ class AlertService:
                     "Critical alert notification could not be dispatched"
                     " — manual follow-up required"
                 ),
+            )
+
+        # Emit domain event for critical findings
+        if alert_type == AlertType.CRITICAL_FINDING:
+            await self._publish(
+                CriticalFinding(
+                    order_id=str(order_id),
+                    report_id=str(report_id) if report_id else "",
+                    alert_id=str(created.id),
+                    finding_description=finding_description or "",
+                    urgency=urgency.value,
+                    notified_physician_id=(
+                        str(notified_physician_id) if notified_physician_id else ""
+                    ),
+                    tenant_id=get_current_tenant_id(),
+                )
             )
 
         logger.warning(
@@ -264,9 +305,9 @@ class AlertService:
                     method=alert.notification_method or NotificationMethod.IN_APP,
                     exc_info=True,
                     msg=(
-                    "Critical alert notification could not be dispatched"
-                    " — manual follow-up required"
-                ),
+                        "Critical alert notification could not be dispatched"
+                        " — manual follow-up required"
+                    ),
                 )
 
         if escalated:

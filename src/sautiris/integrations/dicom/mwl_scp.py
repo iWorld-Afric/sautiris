@@ -67,9 +67,16 @@ def worklist_item_to_dataset(item: WorklistItem) -> Dataset:
     ds.PatientWeight = str(getattr(item, "patient_weight", "") or "")
     ds.MedicalAlerts = str(getattr(item, "medical_alerts", "") or "")
     ds.Allergies = str(getattr(item, "allergies", "") or "")
+    # PS3.4 Table K.6-1: PregnancyStatus is Type 2 — MUST be present even when unknown
     pregnancy = getattr(item, "pregnancy_status", None)
-    if pregnancy is not None:
-        ds.PregnancyStatus = int(pregnancy)
+    ds.PregnancyStatus = int(pregnancy) if pregnancy is not None else ""
+    # Type 2: IssuerOfPatientID (0010,0021) — required, may be zero-length
+    ds.IssuerOfPatientID = str(getattr(item, "issuer_of_patient_id", "") or "")
+
+    # Type 2: AdmissionID (0038,0010) — required, may be zero-length
+    ds.AdmissionID = str(getattr(item, "admission_id", "") or "")
+    # Type 2: ReferencedPatientSequence (0008,1120) — required, may be empty Sequence
+    ds.ReferencedPatientSequence = []
 
     # Procedure-level attributes
     ds.AccessionNumber = item.accession_number or ""
@@ -110,6 +117,8 @@ def worklist_item_to_dataset(item: WorklistItem) -> Dataset:
     sps.ScheduledPerformingPhysicianName = str(
         getattr(item, "scheduled_performing_physician_name", "") or ""
     )
+    # Type 2: ScheduledProtocolCodeSequence (0040,0008) — required, may be empty Sequence
+    sps.ScheduledProtocolCodeSequence = []
 
     if item.scheduled_start:
         if isinstance(item.scheduled_start, datetime):
