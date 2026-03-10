@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, date, datetime
+from typing import ClassVar
 
 import structlog
 from sqlalchemy import inspect
@@ -21,6 +22,7 @@ from sautiris.core.events import (
 from sautiris.core.tenancy import get_current_tenant_id as _get_tenant
 from sautiris.models.order import OrderStatus, RadiologyOrder, Urgency
 from sautiris.repositories.order import OrderRepository
+from sautiris.services.mixins import EventPublisherMixin
 
 logger = structlog.get_logger(__name__)
 
@@ -64,33 +66,13 @@ class OrderNotFoundError(Exception):
     """Raised when an order is not found."""
 
 
-class OrderService:
+class OrderService(EventPublisherMixin):
+    _critical_event_types: ClassVar[tuple[type[DomainEvent], ...]] = (ExamCompleted, ExamStarted)
+
     def __init__(self, session: AsyncSession, event_bus: EventBus | None = None) -> None:
         self.session = session
         self.repo = OrderRepository(session)
         self._event_bus = event_bus
-
-    async def _publish(self, event: DomainEvent) -> None:
-        """Publish a domain event if an event bus is configured."""
-        if self._event_bus is not None:
-            errors = await self._event_bus.publish(event)
-            if errors:
-                for exc in errors:
-                    logger.error(
-                        "event_bus.handler_error",
-                        event_type=event.event_type,
-                        error=str(exc),
-                    )
-                if isinstance(event, (ExamCompleted, ExamStarted)):
-                    logger.critical(
-                        "event_bus.workflow_event_handlers_failed",
-                        event_type=event.event_type,
-                        error_count=len(errors),
-                        msg=(
-                            "Workflow-critical event handlers failed — exam state change"
-                            " may not have been delivered"
-                        ),
-                    )
 
     async def create_order(
         self,
@@ -301,11 +283,13 @@ class OrderService:
 
         order = await self.get_order(order_id)
         old_status = order.status
-        result = await self._transition(order, OrderStatus.CANCELLED)
-        result.special_instructions = (
-            f"{result.special_instructions or ''}\nCANCELLED: {reason}".strip()
+        # Annotate special_instructions BEFORE _transition so the single
+        # repo.update() call inside _transition persists both the status change
+        # and the cancellation reason together (fixes #73: double repo.update).
+        order.special_instructions = (
+            f"{order.special_instructions or ''}\nCANCELLED: {reason}".strip()
         )
-        await self.repo.update(result)
+        result = await self._transition(order, OrderStatus.CANCELLED)
         await self._publish(
             OrderCancelled(
                 order_id=str(result.id),
@@ -313,6 +297,12 @@ class OrderService:
                 reason=reason,
                 tenant_id=result.tenant_id,
             )
+        )
+        logger.info(
+            "order.cancelled",
+            order_id=str(result.id),
+            from_status=old_status,
+            reason=reason,
         )
         return result
 

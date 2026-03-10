@@ -30,6 +30,19 @@ modality vendors who wish to integrate with SautiRIS.
 
 ## 2. Implementation Information
 
+### 2.1 Manufacturer Identification
+
+| Parameter                | Value                                               |
+|--------------------------|-----------------------------------------------------|
+| **Manufacturer**         | iWorld-Afric                                        |
+| **Product Name**         | SautiRIS                                            |
+| **Product Version**      | 1.0.0                                               |
+| **License**              | Open-source (see repository LICENSE file)           |
+| **Source Repository**    | https://github.com/iWorld-Afric/sautiris            |
+| **Issue Tracker / Contact** | https://github.com/iWorld-Afric/sautiris/issues |
+
+### 2.2 DICOM Implementation Parameters
+
 | Parameter          | Value                           |
 |--------------------|---------------------------------|
 | Implementation UID | `1.2.826.0.1.3680043.9.7539.1` |
@@ -320,7 +333,52 @@ service provider per PS3.8.
 
 ---
 
-## 8. Limitations and Notes
+## 8. Multi-Tenancy Considerations
+
+SautiRIS is designed as a multi-tenant RIS.  The following considerations
+apply to DICOM operations in a multi-tenant deployment.
+
+### 8.1 Tenant Isolation
+
+Each tenant's worklist items, MPPS instances, and stored DICOM metadata are
+stored in separate database rows tagged with a `tenant_id` column.  No
+cross-tenant data leakage occurs at the application layer; queries are always
+filtered by the active tenant context.
+
+### 8.2 AE Title per Tenant
+
+SautiRIS supports per-tenant AE title configuration.  Each tenant can be
+assigned a unique AE title prefix so that modalities can route DICOM
+associations to the correct tenant context.
+
+| Setting                             | Description                                             |
+|-------------------------------------|---------------------------------------------------------|
+| `SAUTIRIS_DICOM_MWL_AE_TITLE`      | Default MWL AE title (applies to the default tenant)   |
+| Per-tenant AE title overrides       | Configurable via the tenant administration API          |
+
+### 8.3 Association-to-Tenant Mapping
+
+Incoming DICOM associations are mapped to a tenant using the following
+priority order:
+
+1. The Called AE Title of the association, matched against per-tenant AE
+   title configuration.
+2. The `X-Tenant-ID` HTTP header (for DICOMweb / STOW-RS requests).
+3. The default tenant (`SAUTIRIS_DEFAULT_TENANT_ID`) if no match is found.
+
+> **Note**: In production, always configure explicit AE titles per tenant to
+> avoid ambiguous tenant resolution.
+
+### 8.4 DICOM Metadata Segregation
+
+DICOM datasets forwarded to the PACS adapter are not modified with tenant
+identifiers (to preserve standard DICOM compliance).  Tenant context is
+maintained exclusively within the SautiRIS database and is not embedded in
+DICOM datasets.
+
+---
+
+## 9. Limitations and Notes
 
 1. **MWL Matching**: Universal (empty=all), exact, and wildcard (`*`, `?`) matching supported for PatientName. Fuzzy (phonetic) matching is not supported.
 2. **C-MOVE**: Not implemented. PACS retrieval uses DICOMweb WADO-RS instead.

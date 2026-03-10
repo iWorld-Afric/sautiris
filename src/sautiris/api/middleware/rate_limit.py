@@ -27,10 +27,23 @@ from sautiris.config import SautiRISSettings
 logger = structlog.get_logger(__name__)
 
 _HEALTH_SUFFIXES = ("/health", "/healthz", "/readyz", "/livez")
-_AUTH_SEGMENTS = ("/token", "/auth/", "/login", "/logout", "/refresh")
+
+# #14: Explicit path segment sets — no loose substring matching
+# Auth segment is checked by prefix; apikeys is checked separately.
+_AUTH_PREFIXES = (
+    "/api/v1/auth/",
+    "/api/v1/token",
+    "/api/v1/login",
+    "/api/v1/logout",
+    "/api/v1/refresh",
+)
 
 # Evict stale window keys when the dict exceeds this size to bound memory usage.
 _MAX_WINDOW_KEYS = 10_000
+
+# #70: Number of lock shards to reduce contention under high concurrency.
+# Each IP hashes into one of _LOCK_SHARD_COUNT locks instead of a single global lock.
+_LOCK_SHARD_COUNT = 64
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -39,9 +52,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     def __init__(self, app: object, settings: SautiRISSettings) -> None:
         super().__init__(app)  # type: ignore[arg-type]
         self._settings = settings
-        self._lock = asyncio.Lock()  # asyncio.Lock — safe in async dispatch()
+        # #70: Per-shard locks replace the single global asyncio.Lock
+        self._locks: list[asyncio.Lock] = [asyncio.Lock() for _ in range(_LOCK_SHARD_COUNT)]
         self._windows: dict[str, list[float]] = defaultdict(list)
-        # FIX-5: Validate all rate limit config values at startup to catch
+        # Validate all rate limit config values at startup to catch
         # misconfigured periods (e.g. "100/day") before they crash at request time.
         for _rate_cfg in (
             settings.rate_limit_general,
@@ -67,22 +81,40 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             )
         return int(count_str), windows[period_key]
 
-    def _evict_stale_keys(self) -> None:
-        """Prune empty window buckets when the dict grows beyond threshold.
+    def _get_lock(self, key: str) -> asyncio.Lock:
+        """Return the shard lock for *key* (consistent hash)."""
+        return self._locks[hash(key) % _LOCK_SHARD_COUNT]
 
-        Called while holding ``_lock``.  Only scans when len > _MAX_WINDOW_KEYS
-        so the amortised cost is negligible under normal traffic.
+    def _evict_stale_keys(self, now: float) -> None:
+        """Prune empty and fully-expired window buckets when over threshold.
+
+        #69: Also evict buckets whose newest timestamp is older than any
+        window period (using the maximum of all configured windows as a
+        conservative upper bound).  Called while holding the relevant shard lock.
         """
         if len(self._windows) <= _MAX_WINDOW_KEYS:
             return
-        stale = [k for k, bucket in self._windows.items() if not bucket]
+        # Use the largest configured window as eviction horizon
+        max_window = max(
+            self._parse_limit(self._settings.rate_limit_general)[1],
+            self._parse_limit(self._settings.rate_limit_auth_endpoints)[1],
+            self._parse_limit(self._settings.rate_limit_apikey_create)[1],
+        )
+        stale = [
+            k
+            for k, bucket in self._windows.items()
+            if not bucket or (now - bucket[-1]) > max_window
+        ]
         for k in stale:
             del self._windows[k]
 
     def _classify(self, path: str, method: str) -> str:
-        if "/apikeys" in path and method == "POST":
+        # #14: Use proper prefix/segment matching instead of loose substring `in`
+        # Check apikeys POST first (most specific)
+        segments = path.split("/")
+        if "apikeys" in segments and method == "POST":
             return self._settings.rate_limit_apikey_create
-        if any(seg in path for seg in _AUTH_SEGMENTS):
+        if any(path.startswith(prefix) for prefix in _AUTH_PREFIXES):
             return self._settings.rate_limit_auth_endpoints
         return self._settings.rate_limit_general
 
@@ -94,9 +126,11 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if any(path.endswith(s) for s in _HEALTH_SUFFIXES) or path == "/":
             return await call_next(request)
 
+        # #71: Return 502 (Bad Gateway) when the client IP cannot be determined —
+        # this indicates a misconfigured proxy/load balancer upstream, not a client error.
         if request.client is None:
             return JSONResponse(
-                status_code=400,
+                status_code=502,
                 content={"detail": "Unable to determine client address"},
             )
         client_ip = request.client.host
@@ -109,7 +143,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         now = time.monotonic()
         cutoff = now - window_secs
 
-        async with self._lock:
+        shard_lock = self._get_lock(key)
+        async with shard_lock:
             bucket = self._windows[key]
             self._windows[key] = bucket = [t for t in bucket if t > cutoff]
             if len(bucket) >= max_count:
@@ -121,12 +156,13 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                     path=path,
                     limit=rate_str,
                 )
+                # #13: Include retry_after seconds in the response body
                 return JSONResponse(
                     status_code=429,
-                    content={"detail": "Rate limit exceeded. Please retry later."},
+                    content={"detail": f"Rate limit exceeded. Try again in {retry_after} seconds."},
                     headers={"Retry-After": str(retry_after)},
                 )
             bucket.append(now)
-            self._evict_stale_keys()
+            self._evict_stale_keys(now)
 
         return await call_next(request)

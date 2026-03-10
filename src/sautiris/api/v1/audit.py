@@ -15,7 +15,8 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sautiris.api.deps import get_db, require_permission
+from sautiris.api.deps import get_current_user, get_db, require_permission
+from sautiris.core.auth.base import AuthUser
 from sautiris.models.audit import AuditLog
 
 router = APIRouter(prefix="/audit-logs", tags=["audit"])
@@ -70,9 +71,12 @@ async def list_audit_logs(
     limit: int = Query(default=100, le=1000, description="Max results to return"),
     offset: int = Query(default=0, ge=0, description="Pagination offset"),
     _admin: object = Depends(require_permission("admin:*")),
+    current_user: AuthUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[AuditLog]:
-    stmt = select(AuditLog).order_by(AuditLog.created_at.desc())
+    # #6: Enforce tenant isolation — admins can only query their own tenant's logs
+    stmt = select(AuditLog).where(AuditLog.tenant_id == current_user.tenant_id)
+    stmt = stmt.order_by(AuditLog.created_at.desc())
 
     if user_id is not None:
         stmt = stmt.where(AuditLog.user_id == user_id)

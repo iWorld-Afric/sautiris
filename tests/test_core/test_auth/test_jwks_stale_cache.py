@@ -74,6 +74,70 @@ class TestKeycloakStaleCacheFallback:
         assert exc_info.value.status_code == 503
 
 
+class TestMaxStaleAgeBoundary:
+    """#54: MAX_STALE_AGE boundary — cache older than 24 h raises 503; younger returns stale."""
+
+    async def test_cache_just_within_max_stale_age_returns_stale(self) -> None:
+        """Cache aged (MAX_STALE_AGE - 1) seconds is still within limit → return stale."""
+        from sautiris.core.auth.jwks_base import MAX_STALE_AGE
+
+        provider = _make_keycloak(ttl=1)
+        stale_jwks = {"keys": [{"kid": "stale-key", "kty": "RSA"}]}
+        provider._jwks_cache = stale_jwks
+        # Cache time just within MAX_STALE_AGE (1 second under the limit)
+        provider._cache_time = time.monotonic() - (MAX_STALE_AGE - 1)
+
+        mock_client = AsyncMock()
+        mock_client.get.side_effect = httpx.ConnectError("connection refused")
+        provider._jwks_client = mock_client
+
+        result = await provider._get_jwks()
+        assert result == stale_jwks
+
+    async def test_cache_at_exactly_max_stale_age_raises_503(self) -> None:
+        """Cache aged exactly MAX_STALE_AGE seconds is expired → raise 503.
+
+        The boundary check is ``cache_age < MAX_STALE_AGE`` (strict less-than),
+        so age == MAX_STALE_AGE is over the limit.
+        """
+        from sautiris.core.auth.jwks_base import MAX_STALE_AGE
+
+        provider = _make_keycloak(ttl=1)
+        provider._jwks_cache = {"keys": [{"kid": "expired-key"}]}
+        # Place cache_time exactly MAX_STALE_AGE seconds in the past
+        provider._cache_time = time.monotonic() - MAX_STALE_AGE
+
+        mock_client = AsyncMock()
+        mock_client.get.side_effect = httpx.ConnectError("connection refused")
+        provider._jwks_client = mock_client
+
+        with pytest.raises(HTTPException) as exc_info:
+            await provider._get_jwks()
+        assert exc_info.value.status_code == 503
+
+    async def test_cache_beyond_max_stale_age_raises_503(self) -> None:
+        """Cache aged (MAX_STALE_AGE + 1) seconds → raise 503 (definitely expired)."""
+        from sautiris.core.auth.jwks_base import MAX_STALE_AGE
+
+        provider = _make_oauth2(ttl=1)
+        provider._jwks_cache = {"keys": [{"kid": "very-old-key"}]}
+        provider._cache_time = time.monotonic() - (MAX_STALE_AGE + 1)
+
+        mock_client = AsyncMock()
+        mock_client.get.side_effect = httpx.TimeoutException("timeout", request=None)
+        provider._jwks_client = mock_client
+
+        with pytest.raises(HTTPException) as exc_info:
+            await provider._get_jwks()
+        assert exc_info.value.status_code == 503
+
+    async def test_max_stale_age_is_24_hours(self) -> None:
+        """MAX_STALE_AGE must be exactly 86 400 seconds (24 hours)."""
+        from sautiris.core.auth.jwks_base import MAX_STALE_AGE
+
+        assert MAX_STALE_AGE == 86_400
+
+
 class TestOAuth2StaleCacheFallback:
     """OAuth2: JWKS fetch failure returns stale cache if available."""
 

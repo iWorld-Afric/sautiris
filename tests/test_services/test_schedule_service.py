@@ -218,7 +218,8 @@ async def test_schedule_publish_handler_error_is_logged_as_error(
     start = datetime.now(UTC) + timedelta(hours=5)
     end = start + timedelta(minutes=30)
 
-    with patch("sautiris.services.schedule_service.logger") as mock_logger:
+    # _publish is in the mixin; patch mixins.logger for handler-error logging
+    with patch("sautiris.services.mixins.logger") as mock_logger:
         await svc.create_slot(
             order_id=uuid.uuid4(),
             room_id="ROOM-TEST-1",
@@ -253,7 +254,8 @@ async def test_schedule_publish_no_error_does_not_log_error(
     start = datetime.now(UTC) + timedelta(hours=6)
     end = start + timedelta(minutes=30)
 
-    with patch("sautiris.services.schedule_service.logger") as mock_logger:
+    # _publish is in the mixin; patch mixins.logger for handler-error logging
+    with patch("sautiris.services.mixins.logger") as mock_logger:
         await svc.create_slot(
             order_id=uuid.uuid4(),
             room_id="ROOM-TEST-OK",
@@ -470,6 +472,52 @@ async def test_update_slot_unknown_field_logs_warning(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# #59: ScheduleService logs at correct levels for normal operations
+# ---------------------------------------------------------------------------
+
+
+async def test_schedule_service_logs_correct_levels(db_session: AsyncSession) -> None:
+    """#59: create_slot logs at INFO level; no spurious WARNING or ERROR on success.
+
+    Verifies that the happy-path slot creation does not emit WARNING or ERROR
+    log entries — only INFO.  Spurious high-severity logs on success paths can
+    mask real warnings in production monitoring.
+    """
+    from unittest.mock import patch
+
+    from sautiris.core.events import EventBus
+
+    bus = EventBus()
+    svc = ScheduleService(db_session, event_bus=bus)
+
+    start = datetime.now(UTC) + timedelta(hours=200)
+    end = start + timedelta(minutes=30)
+
+    with patch("sautiris.services.schedule_service.logger") as mock_svc_logger:
+        slot = await svc.create_slot(
+            order_id=uuid.uuid4(),
+            room_id="ROOM-LOG-LEVEL",
+            modality="CT",
+            scheduled_start=start,
+            scheduled_end=end,
+        )
+
+    assert slot is not None
+
+    # On success: logger.info must have been called with "slot_created"
+    info_keys = [call.args[0] for call in mock_svc_logger.info.call_args_list if call.args]
+    assert any("slot_created" in k for k in info_keys), (
+        f"Expected 'slot_created' INFO log. Got info keys: {info_keys}"
+    )
+
+    # No WARNING on a clean success path (unknown fields / non-updatable should be absent)
+    mock_svc_logger.warning.assert_not_called()
+
+    # No ERROR on a clean success path
+    mock_svc_logger.error.assert_not_called()
+
+
 async def test_schedule_publish_handler_error_logged_at_error_level(
     db_session: AsyncSession,
 ) -> None:
@@ -487,7 +535,8 @@ async def test_schedule_publish_handler_error_logged_at_error_level(
     svc = ScheduleService(db_session, event_bus=bus)
 
     start, end = _make_times(offset_hours=100)
-    with patch("sautiris.services.schedule_service.logger") as mock_logger:
+    # _publish is in the mixin; patch mixins.logger for handler-error logging
+    with patch("sautiris.services.mixins.logger") as mock_logger:
         await svc.create_slot(
             order_id=uuid.uuid4(),
             room_id="ROOM-PUBLISH-ERR",

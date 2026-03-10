@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import re
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import sqlalchemy.exc
 import structlog
@@ -38,6 +38,15 @@ PHI_ROUTE_PREFIXES: tuple[str, ...] = (
 
 # FIX-10: Allowlist pattern for client-provided correlation IDs
 _CORRELATION_ID_RE = re.compile(r"^[a-zA-Z0-9\-]{1,64}$")
+
+# #36: Module-level constant avoids reconstructing the dict on every request
+_METHOD_TO_ACTION: Final[dict[str, str]] = {
+    "GET": "READ",
+    "POST": "CREATE",
+    "PUT": "UPDATE",
+    "PATCH": "UPDATE",
+    "DELETE": "DELETE",
+}
 
 
 def _is_phi_route(path: str) -> bool:
@@ -136,23 +145,19 @@ async def _log_phi_access(
         factory = request.app.state.session_factory
         async with factory() as session:
             audit = AuditLogger(session)
-            # Derive action from HTTP method
-            method_to_action = {
-                "GET": "READ",
-                "POST": "CREATE",
-                "PUT": "UPDATE",
-                "PATCH": "UPDATE",
-                "DELETE": "DELETE",
-            }
-            action = method_to_action.get(request.method, request.method)
+            # #36: Use module-level constant instead of per-call dict construction
+            action = _METHOD_TO_ACTION.get(request.method, request.method)
             resource_type = _resource_type_from_path(request.url.path)
+
+            # #11: Truncate User-Agent to 512 chars to prevent oversized audit records
+            user_agent = (request.headers.get("User-Agent") or "")[:512]
 
             await audit.log(
                 user=user,
                 action=action,
                 resource_type=resource_type,
                 ip_address=_get_client_ip(request),
-                user_agent=request.headers.get("User-Agent", ""),
+                user_agent=user_agent,
                 correlation_id=correlation_id,
                 details={
                     "method": request.method,
@@ -161,8 +166,9 @@ async def _log_phi_access(
                 },
             )
             await session.commit()
-    except sqlalchemy.exc.OperationalError:
-        # Audit failures must never break the request cycle
+    except (sqlalchemy.exc.OperationalError, sqlalchemy.exc.DataError):
+        # #11: Catch DataError in addition to OperationalError — oversized fields
+        # cause DataError on some backends; audit failures must never break requests.
         logger.critical(
             "audit_middleware.database_unreachable",
             exc_info=True,

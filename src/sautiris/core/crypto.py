@@ -12,6 +12,7 @@ Key generation:
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -79,7 +80,7 @@ class EncryptedString(TypeDecorator[str]):
         try:
             return _fernet_decrypt(value, key)
         except InvalidToken:
-            if value.startswith("gAAAAA"):
+            if value.startswith(_FERNET_PREFIX):
                 # Value is a Fernet token — decryption failed (wrong key or data corruption).
                 # Returning ciphertext as plaintext would silently corrupt data; raise instead.
                 logger.critical(
@@ -104,24 +105,23 @@ class EncryptedString(TypeDecorator[str]):
             return value
 
 
-# Fernet-encrypted values always start with "gAAAAAB"
+# #7: Unified Fernet prefix — all Fernet-encrypted values start with "gAAAAAB"
 _FERNET_PREFIX = "gAAAAAB"
 
-# Tables and columns that use EncryptedString
-_ENCRYPTED_COLUMNS: tuple[tuple[str, list[str]], ...] = (
-    ("pacs_connections", ["password"]),
-    ("ai_provider_configs", ["api_key", "webhook_secret"]),
+# #38: Use tuple[tuple[str, tuple[str, ...]], ...] for full immutability
+_ENCRYPTED_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("pacs_connections", ("password",)),
+    ("ai_provider_configs", ("api_key", "webhook_secret")),
 )
 
 
+# #37: Frozen dataclass with slots — immutable result type
+@dataclass(frozen=True, slots=True)
 class KeyRotationResult:
     """Result of a key rotation operation."""
 
-    __slots__ = ("rotated_count", "skipped_count")
-
-    def __init__(self, rotated_count: int, skipped_count: int) -> None:
-        self.rotated_count = rotated_count
-        self.skipped_count = skipped_count
+    rotated_count: int
+    skipped_count: int
 
 
 def rotate_encryption_key(
@@ -156,6 +156,7 @@ def rotate_encryption_key_detailed(
     """
     from cryptography.fernet import Fernet  # noqa: PLC0415
     from sqlalchemy import text  # noqa: PLC0415
+    from sqlalchemy.sql import quoted_name  # noqa: PLC0415
 
     old_fernet = Fernet(old_key.encode())
     new_fernet = Fernet(new_key.encode())
@@ -163,8 +164,14 @@ def rotate_encryption_key_detailed(
     skipped = 0
 
     for table, columns in _ENCRYPTED_COLUMNS:
-        col_list = ", ".join(["id", *columns])
-        rows = conn.execute(text(f"SELECT {col_list} FROM {table}")).fetchall()  # noqa: S608
+        # #77: Use quoted_name() for SQL identifiers to prevent SQL injection
+        # instead of raw string interpolation with noqa suppression.
+        quoted_table = str(quoted_name(table, quote=True))
+        quoted_cols = ", ".join(
+            [str(quoted_name("id", quote=True))]
+            + [str(quoted_name(c, quote=True)) for c in columns]
+        )
+        rows = conn.execute(text(f"SELECT {quoted_cols} FROM {quoted_table}")).fetchall()
         for row in rows:
             row_id = row[0]
             updates: dict[str, str] = {}
@@ -193,10 +200,11 @@ def rotate_encryption_key_detailed(
                 updates[col] = new_fernet.encrypt(plaintext.encode()).decode()
             if updates:
                 rotated += len(updates)
-                set_clause = ", ".join(f"{k} = :{k}" for k in updates)
+                quoted_t = str(quoted_name(table, quote=True))
+                set_clause = ", ".join(f"{quoted_name(k, quote=True)} = :{k}" for k in updates)
                 updates["id"] = str(row_id)
                 conn.execute(
-                    text(f"UPDATE {table} SET {set_clause} WHERE id = :id"),  # noqa: S608
+                    text(f"UPDATE {quoted_t} SET {set_clause} WHERE id = :id"),
                     updates,
                 )
 

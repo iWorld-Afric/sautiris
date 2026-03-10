@@ -30,9 +30,30 @@ class WorklistRepository(TenantAwareRepository[WorklistItem]):
         scheduled_station_ae_title: str | None = None,
         date_from: date | None = None,
         date_to: date | None = None,
+        patient_name_pattern: str | None = None,
         offset: int = 0,
         limit: int = 100,
     ) -> tuple[Sequence[WorklistItem], int]:
+        """List worklist items with optional filters.
+
+        Args:
+            modality: Filter by modality code (exact match).
+            status: Filter by worklist status.
+            scheduled_station_ae_title: Filter by AE title (exact match).
+            date_from: Filter items scheduled on or after this date.
+            date_to: Filter items scheduled on or before this date.
+            patient_name_pattern: SQL LIKE pattern for patient name matching.
+                Already-escaped pattern produced by
+                :func:`~sautiris.integrations.dicom.mwl_scp.extract_query_filters`
+                (DICOM wildcards converted, SQL metacharacters pre-escaped).
+                Issue #4: wires the DICOM patient name wildcard filter through to
+                the database query.
+            offset: Number of results to skip (pagination).
+            limit: Maximum number of results to return.
+
+        Returns:
+            A tuple of (items sequence, total count).
+        """
         base = select(WorklistItem).where(WorklistItem.tenant_id == self._tenant_id)
         count_base = (
             select(func.count())
@@ -57,6 +78,12 @@ class WorklistRepository(TenantAwareRepository[WorklistItem]):
         if date_to:
             base = base.where(WorklistItem.scheduled_start <= date_to)
             count_base = count_base.where(WorklistItem.scheduled_start <= date_to)
+        if patient_name_pattern:
+            # Pattern is already escaped + converted from DICOM wildcards in
+            # extract_query_filters(); apply directly as a case-insensitive LIKE.
+            # Issue #4: wire patient_name_pattern from DICOM MWL C-FIND queries.
+            base = base.where(WorklistItem.patient_name.ilike(patient_name_pattern))
+            count_base = count_base.where(WorklistItem.patient_name.ilike(patient_name_pattern))
 
         total_result = await self.session.execute(count_base)
         total = total_result.scalar_one()

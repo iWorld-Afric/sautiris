@@ -224,7 +224,8 @@ class TestPublishErrorLogging:
 
         svc = DoseService(db_session, event_bus=bus)
 
-        with patch("sautiris.services.dose_service.logger") as mock_logger:
+        # _publish is in the mixin module; patch that logger for handler-error logging
+        with patch("sautiris.services.mixins.logger") as mock_logger:
             await svc.record_dose(
                 order_id=order.id,  # type: ignore[union-attr]
                 modality="CT",
@@ -252,7 +253,8 @@ class TestPublishErrorLogging:
         bus.subscribe("dose.drl_exceeded", _failing_handler)
         svc = DoseService(db_session, event_bus=bus)
 
-        with patch("sautiris.services.dose_service.logger") as mock_logger:
+        # _publish is in the mixin module; patch that logger for handler-error logging
+        with patch("sautiris.services.mixins.logger") as mock_logger:
             await svc.record_dose(
                 order_id=order.id,  # type: ignore[union-attr]
                 modality="CT",
@@ -263,7 +265,7 @@ class TestPublishErrorLogging:
             mock_logger.critical.assert_called()
             call_args = mock_logger.critical.call_args
             event_key = call_args[0][0] if call_args[0] else ""
-            assert "drl" in event_key.lower() or "drl_exceeded" in event_key.lower()
+            assert "critical_event_handlers_failed" in event_key
 
 
 # ---------------------------------------------------------------------------

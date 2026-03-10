@@ -190,7 +190,8 @@ async def test_event_publish_errors_are_logged(db_session: AsyncSession) -> None
     bus.subscribe("order.created", _failing_handler)
     service = OrderService(db_session, event_bus=bus)
 
-    with patch("sautiris.services.order_service.logger") as mock_logger:
+    # _publish is in the mixin; patch mixins.logger for handler-error logging
+    with patch("sautiris.services.mixins.logger") as mock_logger:
         await service.create_order(
             patient_id=uuid.uuid4(),
             modality="CT",
@@ -218,7 +219,8 @@ async def test_event_publish_no_errors_does_not_log_error(db_session: AsyncSessi
     bus.subscribe("order.created", _ok_handler)
     service = OrderService(db_session, event_bus=bus)
 
-    with patch("sautiris.services.order_service.logger") as mock_logger:
+    # _publish is in the mixin; patch mixins.logger for handler-error logging
+    with patch("sautiris.services.mixins.logger") as mock_logger:
         await service.create_order(
             patient_id=uuid.uuid4(),
             modality="MR",

@@ -53,10 +53,6 @@ class AlertResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class AlertAcknowledgeRequest(BaseModel):
-    pass
-
-
 class AlertStatsResponse(BaseModel):
     total: int
     pending: int

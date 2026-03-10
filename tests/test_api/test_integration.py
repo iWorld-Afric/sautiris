@@ -259,3 +259,56 @@ async def test_invalid_uuid_returns_422(client: AsyncClient) -> None:
     """Invalid UUID in path parameter returns 422 Unprocessable Entity."""
     resp = await client.get("/api/v1/orders/not-a-uuid")
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Billing — create assignment and list
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_billing_create_and_list(admin_client: AsyncClient, db_session: AsyncSession) -> None:
+    """#61: Assign a billing code to an order, then retrieve the assignment via GET.
+
+    Round-trip: POST /billing/assign → 201, GET /billing/order/{order_id} → code appears.
+    """
+    from sautiris.models.billing import BillingCode, CodeSystem
+    from tests.conftest import create_test_order
+
+    # Create a billing code directly in the DB (no API endpoint for code creation)
+    billing_code = BillingCode(
+        id=uuid.uuid4(),
+        code_system=CodeSystem.CPT,
+        code="71046",
+        display="Chest X-Ray, 2 Views",
+        modality="CR",
+        is_active=True,
+    )
+    db_session.add(billing_code)
+    await db_session.flush()
+
+    # Create a COMPLETED order to assign the billing code to
+    order = await create_test_order(db_session, modality="CR", status="COMPLETED")
+
+    # Assign via API (requires billing:manage → admin user)
+    resp = await admin_client.post(
+        "/api/v1/billing/assign",
+        json={
+            "order_id": str(order.id),
+            "billing_code_id": str(billing_code.id),
+            "quantity": 1,
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    assignment = resp.json()
+    assert assignment["order_id"] == str(order.id)
+    assert assignment["billing_code_id"] == str(billing_code.id)
+    assert assignment["quantity"] == 1
+    assignment_id = assignment["id"]
+
+    # List order billing via API (requires billing:read → admin has this)
+    resp = await admin_client.get(f"/api/v1/billing/order/{order.id}")
+    assert resp.status_code == 200, resp.text
+    items = resp.json()
+    ids = [item["id"] for item in items]
+    assert assignment_id in ids

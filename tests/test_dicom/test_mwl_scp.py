@@ -275,11 +275,17 @@ class TestIssue3RequiredTags:
         assert ds.PregnancyStatus == 2
 
     def test_pregnancy_status_present_when_none(self) -> None:
-        """Type 2: PregnancyStatus MUST be present even when None (zero-length allowed)."""
+        """Type 2: PregnancyStatus MUST be present even when None (zero-length allowed).
+
+        Issue #15: pydicom raises a warning when assigning "" to a VR US tag.
+        The correct zero-length representation for VR US is None (pydicom stores
+        the tag as present with None value, which is valid for Type 2 tags).
+        """
         item = _make_worklist_item(study_instance_uid=None)
         ds = worklist_item_to_dataset(item)
         assert hasattr(ds, "PregnancyStatus")
-        assert ds.PregnancyStatus == ""
+        # None represents a valid zero-length VR US value (avoids pydicom warning)
+        assert ds.PregnancyStatus is None
 
     def test_scheduled_protocol_code_sequence_present(self) -> None:
         """Type 2: ScheduledProtocolCodeSequence (0040,0008) must be present."""
@@ -717,3 +723,57 @@ class TestBuildDicomSSLContext:
         assert mpps._build_ssl_context() is None
         assert mwl._build_ssl_context() is None
         assert store._build_ssl_context() is None
+
+
+# ---------------------------------------------------------------------------
+# #58: StudyInstanceUID is preserved across the full MWL round-trip
+# ---------------------------------------------------------------------------
+
+
+class TestStudyInstanceUIDRoundTrip:
+    """#58: study_instance_uid set on a WorklistItem must appear in the MWL response dataset.
+
+    Verifies that when a worklist item carries a pre-assigned StudyInstanceUID
+    (e.g. from a prior MPPS N-CREATE), worklist_item_to_dataset() returns that
+    exact UID — not a freshly generated one.  This is the key persistence guarantee
+    that ensures the modality and RIS agree on the same Study UID.
+    """
+
+    def test_study_instance_uid_preserved_in_worklist_response(self) -> None:
+        """A WorklistItem's study_instance_uid survives the item → DICOM dataset conversion.
+
+        Round-trip: assign a known UID to item → call worklist_item_to_dataset()
+        → read StudyInstanceUID from the returned Dataset → must match exactly.
+        """
+        known_uid = "1.2.826.0.1.3680043.9.7539.1.20260310.1"
+        item = _make_worklist_item(study_instance_uid=known_uid)
+
+        ds = worklist_item_to_dataset(item)
+
+        assert hasattr(ds, "StudyInstanceUID"), "Dataset must have StudyInstanceUID tag"
+        returned_uid = str(ds.StudyInstanceUID)
+        assert returned_uid == known_uid, (
+            f"UID mismatch: expected {known_uid!r}, got {returned_uid!r}. "
+            "The MWL response must return the persisted UID, not generate a new one."
+        )
+
+    def test_none_study_instance_uid_generates_valid_uid(self) -> None:
+        """If study_instance_uid is None, a valid DICOM UID is generated (not empty/None)."""
+        item = _make_worklist_item(study_instance_uid=None)
+        ds = worklist_item_to_dataset(item)
+
+        uid = str(ds.StudyInstanceUID)
+        assert uid, "Generated UID must not be empty"
+        assert "." in uid, f"Generated UID must contain dots: {uid!r}"
+
+    def test_generated_uid_changes_for_different_items(self) -> None:
+        """Two items without a pre-assigned UID each get distinct generated UIDs."""
+        item_a = _make_worklist_item(study_instance_uid=None, patient_id="PAT-A")
+        item_b = _make_worklist_item(study_instance_uid=None, patient_id="PAT-B")
+
+        ds_a = worklist_item_to_dataset(item_a)
+        ds_b = worklist_item_to_dataset(item_b)
+
+        uid_a = str(ds_a.StudyInstanceUID)
+        uid_b = str(ds_b.StudyInstanceUID)
+        assert uid_a != uid_b, f"Two distinct items must receive distinct UIDs, got same: {uid_a!r}"

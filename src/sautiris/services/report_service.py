@@ -5,12 +5,20 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
+from typing import ClassVar
 
 import structlog
 from sqlalchemy import inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sautiris.core.events import CriticalFinding, DomainEvent, EventBus, ReportFinalized
+from sautiris.core.events import (
+    CriticalFinding,
+    DomainEvent,
+    EventBus,
+    ReportAmended,
+    ReportCreated,
+    ReportFinalized,
+)
 from sautiris.models.report import (
     RadiologyReport,
     ReportStatus,
@@ -18,6 +26,7 @@ from sautiris.models.report import (
     ReportVersion,
 )
 from sautiris.repositories.report import ReportRepository, ReportTemplateRepository
+from sautiris.services.mixins import EventPublisherMixin
 
 logger = structlog.get_logger(__name__)
 
@@ -57,34 +66,14 @@ class InvalidReportTransitionError(Exception):
     pass
 
 
-class ReportService:
+class ReportService(EventPublisherMixin):
+    _critical_event_types: ClassVar[tuple[type[DomainEvent], ...]] = (CriticalFinding,)
+
     def __init__(self, session: AsyncSession, event_bus: EventBus | None = None) -> None:
         self.session = session
         self.report_repo = ReportRepository(session)
         self.template_repo = ReportTemplateRepository(session)
         self._event_bus = event_bus
-
-    async def _publish(self, event: DomainEvent) -> None:
-        """Publish a domain event if an event bus is configured."""
-        if self._event_bus is not None:
-            errors = await self._event_bus.publish(event)
-            if errors:
-                for exc in errors:
-                    logger.error(
-                        "event_bus.handler_error",
-                        event_type=event.event_type,
-                        error=str(exc),
-                    )
-                if isinstance(event, CriticalFinding):
-                    logger.critical(
-                        "event_bus.critical_finding_handlers_failed",
-                        event_type=event.event_type,
-                        error_count=len(errors),
-                        msg=(
-                            "CriticalFinding handlers failed — patient safety event "
-                            "may not have been delivered"
-                        ),
-                    )
 
     async def create_report(
         self,
@@ -128,8 +117,17 @@ class ReportService:
         created = await self.report_repo.create(report)
 
         await self._create_version(created, changed_by=reported_by)
-        await self._emit("report.created", created)
-        logger.info("report_created", report_id=str(created.id))
+        reported_by_str = str(created.reported_by) if created.reported_by else ""
+        await self._publish(
+            ReportCreated(
+                report_id=str(created.id),
+                order_id=str(created.order_id),
+                accession_number=created.accession_number,
+                reported_by=reported_by_str,
+                tenant_id=created.tenant_id,
+            )
+        )
+        logger.info("report_created", report_id=str(created.id), order_id=str(created.order_id))
         return created
 
     async def get_report(self, report_id: uuid.UUID) -> RadiologyReport:
@@ -206,8 +204,32 @@ class ReportService:
         report.approved_at = datetime.now(UTC)
         updated = await self.report_repo.update(report)
         await self._create_version(updated, changed_by=approved_by)
-        await self._emit("report.finalized", updated)
-        logger.info("report_finalized", report_id=str(report_id))
+        reported_by_str = str(updated.reported_by) if updated.reported_by else ""
+        await self._publish(
+            ReportFinalized(
+                order_id=str(updated.order_id),
+                report_id=str(updated.id),
+                accession_number=updated.accession_number,
+                reported_by=reported_by_str,
+                is_critical=updated.is_critical,
+                tenant_id=updated.tenant_id,
+            )
+        )
+        if updated.is_critical:
+            await self._publish(
+                CriticalFinding(
+                    order_id=str(updated.order_id),
+                    report_id=str(updated.id),
+                    finding_description="Critical finding on finalized report",
+                    tenant_id=updated.tenant_id,
+                )
+            )
+        logger.info(
+            "report_finalized",
+            report_id=str(report_id),
+            order_id=str(updated.order_id),
+            is_critical=updated.is_critical,
+        )
         return updated
 
     async def amend_report(
@@ -232,8 +254,16 @@ class ReportService:
             report.recommendation = recommendation
         updated = await self.report_repo.update(report)
         await self._create_version(updated, changed_by=changed_by)
-        await self._emit("report.amended", updated, changed_by=changed_by)
-        logger.info("report_amended", report_id=str(report_id))
+        await self._publish(
+            ReportAmended(
+                report_id=str(updated.id),
+                order_id=str(updated.order_id),
+                accession_number=updated.accession_number,
+                changed_by=str(changed_by) if changed_by else "",
+                tenant_id=updated.tenant_id,
+            )
+        )
+        logger.info("report_amended", report_id=str(report_id), order_id=str(updated.order_id))
         return updated
 
     async def create_addendum(
@@ -291,70 +321,6 @@ class ReportService:
             changed_at=datetime.now(UTC),
         )
         return await self.report_repo.create_version(version)
-
-    async def _emit(
-        self,
-        event_type: str,
-        report: RadiologyReport,
-        *,
-        changed_by: uuid.UUID | None = None,
-    ) -> None:
-        from sautiris.core.events import ReportAmended, ReportCreated  # noqa: PLC0415
-
-        reported_by_str = str(report.reported_by) if report.reported_by else ""
-
-        if event_type == "report.finalized":
-            await self._publish(
-                ReportFinalized(
-                    order_id=str(report.order_id),
-                    report_id=str(report.id),
-                    accession_number=report.accession_number,
-                    reported_by=reported_by_str,
-                    is_critical=report.is_critical,
-                    tenant_id=report.tenant_id,
-                )
-            )
-            if report.is_critical:
-                await self._publish(
-                    CriticalFinding(
-                        order_id=str(report.order_id),
-                        report_id=str(report.id),
-                        finding_description="Critical finding on finalized report",
-                        tenant_id=report.tenant_id,
-                    )
-                )
-        elif event_type == "report.created":
-            await self._publish(
-                ReportCreated(
-                    report_id=str(report.id),
-                    order_id=str(report.order_id),
-                    accession_number=report.accession_number,
-                    reported_by=reported_by_str,
-                    tenant_id=report.tenant_id,
-                )
-            )
-        elif event_type == "report.amended":
-            await self._publish(
-                ReportAmended(
-                    report_id=str(report.id),
-                    order_id=str(report.order_id),
-                    accession_number=report.accession_number,
-                    changed_by=str(changed_by) if changed_by else "",
-                    tenant_id=report.tenant_id,
-                )
-            )
-        else:
-            await self._publish(
-                DomainEvent(
-                    event_type=event_type,
-                    payload={
-                        "report_id": str(report.id),
-                        "order_id": str(report.order_id),
-                        "status": report.report_status,
-                    },
-                    tenant_id=report.tenant_id,
-                )
-            )
 
     # --- Template management ---
 

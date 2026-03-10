@@ -4,15 +4,22 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime
+from typing import ClassVar
 
 import structlog
 from sqlalchemy import inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sautiris.core.events import DomainEvent, EventBus
+from sautiris.core.events import (
+    DomainEvent,
+    EventBus,
+    ScheduleSlotCreated,
+    ScheduleSlotUpdated,
+)
 from sautiris.core.tenancy import get_current_tenant_id
 from sautiris.models.schedule import ScheduleSlot, SlotStatus
 from sautiris.repositories.schedule import ScheduleRepository
+from sautiris.services.mixins import EventPublisherMixin
 
 logger = structlog.get_logger(__name__)
 
@@ -44,23 +51,14 @@ class SlotNotDeletableError(Exception):
     """Raised when trying to delete a non-AVAILABLE slot."""
 
 
-class ScheduleService:
+class ScheduleService(EventPublisherMixin):
+    # No safety-critical event types for schedule service; default to empty tuple.
+    _critical_event_types: ClassVar[tuple[type[DomainEvent], ...]] = ()
+
     def __init__(self, session: AsyncSession, event_bus: EventBus | None = None) -> None:
         self.session = session
         self.repo = ScheduleRepository(session)
         self._event_bus = event_bus
-
-    async def _publish(self, event: DomainEvent) -> None:
-        """Publish a domain event if an event bus is configured."""
-        if self._event_bus is not None:
-            errors = await self._event_bus.publish(event)
-            if errors:
-                for exc in errors:
-                    logger.error(
-                        "event_bus.handler_error",
-                        event_type=event.event_type,
-                        error=str(exc),
-                    )
 
     async def create_slot(
         self,
@@ -101,7 +99,17 @@ class ScheduleService:
             notes=notes,
         )
         created = await self.repo.create(slot)
-        await self._emit("schedule.slot_created", created)
+        tenant_id = get_current_tenant_id()
+        await self._publish(
+            ScheduleSlotCreated(
+                slot_id=str(created.id),
+                order_id=str(created.order_id),
+                room_id=created.room_id,
+                modality=created.modality,
+                status=created.status,
+                tenant_id=tenant_id,
+            )
+        )
         logger.info("slot_created", slot_id=str(created.id), room=room_id)
         return created
 
@@ -143,7 +151,17 @@ class ScheduleService:
             elif key in known_fields:
                 logger.warning("update.non_updatable_field", field=key, model="ScheduleSlot")
         updated = await self.repo.update(slot)
-        await self._emit("schedule.slot_updated", updated)
+        tenant_id = get_current_tenant_id()
+        await self._publish(
+            ScheduleSlotUpdated(
+                slot_id=str(updated.id),
+                order_id=str(updated.order_id),
+                room_id=updated.room_id,
+                modality=updated.modality,
+                status=updated.status,
+                tenant_id=tenant_id,
+            )
+        )
         return updated
 
     async def delete_slot(self, slot_id: uuid.UUID) -> None:
@@ -210,46 +228,4 @@ class ScheduleService:
         )
         return list(conflicts)
 
-    async def _emit(self, event_type: str, slot: ScheduleSlot) -> None:
-        from sautiris.core.events import (  # noqa: PLC0415
-            ScheduleSlotCreated,
-            ScheduleSlotUpdated,
-        )
 
-        tenant_id = get_current_tenant_id()
-
-        if event_type == "schedule.slot_created":
-            await self._publish(
-                ScheduleSlotCreated(
-                    slot_id=str(slot.id),
-                    order_id=str(slot.order_id),
-                    room_id=slot.room_id,
-                    modality=slot.modality,
-                    status=slot.status,
-                    tenant_id=tenant_id,
-                )
-            )
-        elif event_type == "schedule.slot_updated":
-            await self._publish(
-                ScheduleSlotUpdated(
-                    slot_id=str(slot.id),
-                    order_id=str(slot.order_id),
-                    room_id=slot.room_id,
-                    modality=slot.modality,
-                    status=slot.status,
-                    tenant_id=tenant_id,
-                )
-            )
-        else:
-            await self._publish(
-                DomainEvent(
-                    event_type=event_type,
-                    payload={
-                        "slot_id": str(slot.id),
-                        "order_id": str(slot.order_id),
-                        "room_id": slot.room_id,
-                        "status": slot.status,
-                    },
-                    tenant_id=tenant_id,
-                )
-            )

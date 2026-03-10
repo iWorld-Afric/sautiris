@@ -175,7 +175,7 @@ class TestRateLimiterNullClient:
         call_next = AsyncMock(return_value=JSONResponse({"ok": True}))
         response = await mw.dispatch(mock_request, call_next)
 
-        assert response.status_code == 400
+        assert response.status_code == 502
         # Verify the body content
         import json
 

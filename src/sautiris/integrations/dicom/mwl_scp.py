@@ -14,17 +14,20 @@ from typing import TYPE_CHECKING, Any
 import structlog
 from pydicom.dataset import Dataset
 from pydicom.uid import generate_uid
-from pynetdicom import AE, evt
+from pynetdicom import AE, evt  # AE imported here so tests can patch this module's AE
 
+from sautiris.integrations.dicom.base_scp import BaseSCPServer
 from sautiris.integrations.dicom.constants import (
     CHARSET_UTF8,
     DEFAULT_TRANSFER_SYNTAXES,
-    build_dicom_ssl_context,
+    DicomHandlerList,
 )
 
-if TYPE_CHECKING:
-    import ssl  # noqa: F401
+# Re-exported for backwards compatibility with existing imports.
+# #29: new code should import DEFAULT_TRANSFER_SYNTAXES from constants directly.
+TRANSFER_SYNTAXES = DEFAULT_TRANSFER_SYNTAXES
 
+if TYPE_CHECKING:
     from pynetdicom.events import Event
 
     from sautiris.integrations.dicom.security import DicomAssociationSecurity  # noqa: F401
@@ -34,9 +37,6 @@ logger = structlog.get_logger(__name__)
 
 # Modality Worklist Information Model - FIND SOP Class
 MWL_FIND_SOP_CLASS = "1.2.840.10008.5.1.4.31"
-
-# Re-exported for backwards compatibility
-TRANSFER_SYNTAXES = DEFAULT_TRANSFER_SYNTAXES
 
 
 def worklist_item_to_dataset(item: WorklistItem) -> Dataset:
@@ -71,9 +71,11 @@ def worklist_item_to_dataset(item: WorklistItem) -> Dataset:
     ds.PatientWeight = str(getattr(item, "patient_weight", "") or "")
     ds.MedicalAlerts = str(getattr(item, "medical_alerts", "") or "")
     ds.Allergies = str(getattr(item, "allergies", "") or "")
-    # PS3.4 Table K.6-1: PregnancyStatus is Type 2 — MUST be present even when unknown
+    # PS3.4 Table K.6-1: PregnancyStatus (0010,21C0) is VR US, Type 2.
+    # Zero-length US value must be represented as None (not ""), otherwise
+    # pydicom emits a warning flood for the empty-string sentinel (#15).
     pregnancy = getattr(item, "pregnancy_status", None)
-    ds.PregnancyStatus = int(pregnancy) if pregnancy is not None else ""
+    ds.PregnancyStatus = int(pregnancy) if pregnancy is not None else None
     # Type 2: IssuerOfPatientID (0010,0021) — required, may be zero-length
     ds.IssuerOfPatientID = str(getattr(item, "issuer_of_patient_id", "") or "")
 
@@ -89,9 +91,19 @@ def worklist_item_to_dataset(item: WorklistItem) -> Dataset:
     ds.RequestedProcedureDescription = item.requested_procedure_description or ""
     ds.RequestedProcedurePriority = str(getattr(item, "requested_procedure_priority", "") or "")
 
-    # Type 1 — StudyInstanceUID: generate a new UID if the item has no study UID yet
+    # Type 1 — StudyInstanceUID: generate a new UID if the item has no study UID yet.
+    # #19: log a warning when falling back to a generated UID so operators are aware.
     study_uid = getattr(item, "study_instance_uid", None)
-    ds.StudyInstanceUID = study_uid if study_uid else generate_uid()
+    if study_uid:
+        ds.StudyInstanceUID = study_uid
+    else:
+        generated = generate_uid()
+        logger.warning(
+            "mwl.study_uid_generated",
+            item_id=str(getattr(item, "id", "unknown")),
+            generated_uid=str(generated),
+        )
+        ds.StudyInstanceUID = generated
 
     # Type 2 study-level tags
     ds.StudyID = str(getattr(item, "study_id", "") or "")
@@ -178,7 +190,7 @@ def extract_query_filters(identifier: Dataset) -> dict[str, Any]:
 
     # Check Scheduled Procedure Step Sequence for modality/AE title/date/status
     sps_seq = getattr(identifier, "ScheduledProcedureStepSequence", None)
-    if sps_seq and len(sps_seq) > 0:
+    if sps_seq and len(sps_seq) > 0:  # noqa: SIM102
         sps = sps_seq[0]
         modality = getattr(sps, "Modality", None)
         if modality and str(modality).strip():
@@ -212,7 +224,7 @@ def extract_query_filters(identifier: Dataset) -> dict[str, Any]:
     return filters
 
 
-class MWLServer:
+class MWLServer(BaseSCPServer):
     """Modality Worklist SCP server.
 
     Uses pynetdicom to run a C-FIND SCP. On each query, it calls the
@@ -227,6 +239,11 @@ class MWLServer:
         loop: The asyncio event loop to run async callbacks on.
         bind_address: IP address to bind to (default ``"127.0.0.1"``).
             Issue #17: changed default from 0.0.0.0 to localhost-only.
+        security: Optional DicomAssociationSecurity for AE whitelist/rate/connection limits.
+        tls_cert: Path to TLS certificate file.  Empty string disables TLS.
+        tls_key: Path to TLS private key file.  Empty string disables TLS.
+        tls_ca_cert: Path to CA certificate for mutual TLS.  Empty string
+            disables client verification.
     """
 
     def __init__(
@@ -241,16 +258,40 @@ class MWLServer:
         tls_key: str = "",
         tls_ca_cert: str = "",
     ) -> None:
-        self.ae_title = ae_title
-        self.port = port
+        super().__init__(
+            ae_title=ae_title,
+            port=port,
+            loop=loop,
+            bind_address=bind_address,
+            security=security,
+            tls_cert=tls_cert,
+            tls_key=tls_key,
+            tls_ca_cert=tls_ca_cert,
+        )
         self._query_callback = query_callback
-        self._loop = loop
-        self._bind_address = bind_address
-        self._security = security
-        self._tls_cert = tls_cert
-        self._tls_key = tls_key
-        self._tls_ca_cert = tls_ca_cert
-        self._ae: AE | None = None
+
+    # ------------------------------------------------------------------
+    # BaseSCPServer interface
+    # ------------------------------------------------------------------
+
+    def _make_ae(self) -> AE:
+        """Use this module's AE so that ``patch('...mwl_scp.AE')`` works in tests."""
+        return AE(ae_title=self.ae_title)
+
+    def _get_sop_classes_and_handlers(self) -> tuple[list[str], DicomHandlerList]:
+        return [MWL_FIND_SOP_CLASS], [(evt.EVT_C_FIND, self._handle_find)]
+
+    def _log_started(self, tls_enabled: bool) -> None:
+        logger.info(
+            "mwl.server_started",
+            ae_title=self.ae_title,
+            port=self.port,
+            tls_enabled=tls_enabled,
+        )
+
+    # ------------------------------------------------------------------
+    # C-FIND handler
+    # ------------------------------------------------------------------
 
     def _handle_find(self, event: Event) -> Any:
         """Handle a C-FIND request from a modality."""
@@ -269,65 +310,33 @@ class MWLServer:
                 yield 0xC001, None
                 return
 
+        total = len(items)
+        skipped = 0
         for item in items:
             try:
                 ds = worklist_item_to_dataset(item)
                 yield 0xFF00, ds
             except Exception:
+                skipped += 1
                 logger.error(
                     "mwl.item_conversion_error",
                     item_id=str(getattr(item, "id", "unknown")),
                     exc_info=True,
                 )
 
-    def _build_ssl_context(self) -> ssl.SSLContext | None:
-        """Build an SSL context from TLS cert/key/CA parameters."""
-        return build_dicom_ssl_context(self._tls_cert, self._tls_key, self._tls_ca_cert)
-
-    def start(self) -> None:
-        """Start the MWL SCP in non-blocking mode."""
-        self._ae = AE(ae_title=self.ae_title)
-        # Issue #9 — register all 8 supported transfer syntaxes
-        self._ae.add_supported_context(MWL_FIND_SOP_CLASS, TRANSFER_SYNTAXES)
-
-        handlers: list[tuple[Any, Any]] = [
-            (evt.EVT_C_FIND, self._handle_find),
-        ]
-
-        # Issue #6 — wire DicomAssociationSecurity handlers
-        if self._security:
-            handlers.extend(
-                [
-                    (evt.EVT_REQUESTED, self._security.handle_association_request),
-                    (evt.EVT_RELEASED, self._security.handle_association_released),
-                    (evt.EVT_ABORTED, self._security.handle_association_aborted),
-                ]
+        # #18: log at CRITICAL when items were skipped so operators can investigate
+        if skipped:
+            logger.critical(
+                "mwl.items_skipped",
+                skipped_count=skipped,
+                total=total,
             )
 
-        ssl_context = self._build_ssl_context()
-        if ssl_context is None:
-            logger.warning(
-                "mwl.tls_disabled",
-                ae_title=self.ae_title,
-                port=self.port,
-                msg="MWL SCP starting without TLS — DICOM traffic is unencrypted",
-            )
-        self._ae.start_server(
-            (self._bind_address, self.port),
-            block=False,
-            ssl_context=ssl_context,
-            evt_handlers=handlers,  # type: ignore[arg-type]
-        )
-        logger.info(
-            "mwl.server_started",
-            ae_title=self.ae_title,
-            port=self.port,
-            tls_enabled=ssl_context is not None,
-        )
+    # ------------------------------------------------------------------
+    # Lifecycle — delegate to base; keep stop() for instance-clearing
+    # ------------------------------------------------------------------
 
     def stop(self) -> None:
         """Stop the MWL SCP."""
-        if self._ae:
-            self._ae.shutdown()
-            self._ae = None
-            logger.info("mwl.server_stopped")
+        super().stop()
+        logger.info("mwl.server_stopped")

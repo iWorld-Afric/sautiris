@@ -19,18 +19,27 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 from pydicom.dataset import Dataset
-from pynetdicom import AE, evt
+from pynetdicom import AE, evt  # AE imported here so tests can patch this module's AE
 
+from sautiris.integrations.dicom.base_scp import BaseSCPServer
 from sautiris.integrations.dicom.constants import (
     CHARSET_UTF8,
     DEFAULT_TRANSFER_SYNTAXES,
-    build_dicom_ssl_context,
+    DicomHandlerList,
 )
 from sautiris.models.mpps import MPPSStatusEnum
 
-if TYPE_CHECKING:
-    import ssl  # noqa: F401
+# Re-exported for backwards compatibility with existing imports.
+# #29: new code should import DEFAULT_TRANSFER_SYNTAXES from constants directly.
+TRANSFER_SYNTAXES = DEFAULT_TRANSFER_SYNTAXES
 
+# Issue #31 — these module-level aliases are deprecated; use MPPSStatusEnum directly.
+# Kept as re-exports so existing test imports don't break.
+MPPS_STATUS_IN_PROGRESS = MPPSStatusEnum.IN_PROGRESS
+MPPS_STATUS_COMPLETED = MPPSStatusEnum.COMPLETED
+MPPS_STATUS_DISCONTINUED = MPPSStatusEnum.DISCONTINUED
+
+if TYPE_CHECKING:
     from pynetdicom.events import Event
 
     from sautiris.integrations.dicom.security import DicomAssociationSecurity  # noqa: F401
@@ -39,14 +48,6 @@ logger = structlog.get_logger(__name__)
 
 # MPPS SOP Class UID
 MPPS_SOP_CLASS = "1.2.840.10008.3.1.2.3.3"
-
-# Re-exported for backwards compatibility (imported from constants.py)
-TRANSFER_SYNTAXES = DEFAULT_TRANSFER_SYNTAXES
-
-# Issue #14 — valid MPPS status values (use enum for type safety)
-MPPS_STATUS_IN_PROGRESS = MPPSStatusEnum.IN_PROGRESS
-MPPS_STATUS_COMPLETED = MPPSStatusEnum.COMPLETED
-MPPS_STATUS_DISCONTINUED = MPPSStatusEnum.DISCONTINUED
 
 # Issue #14 — valid target statuses reachable via N-SET from IN PROGRESS
 MPPS_TERMINAL_STATUSES: frozenset[MPPSStatusEnum] = frozenset(
@@ -84,6 +85,15 @@ def extract_mpps_data(dataset: Dataset) -> dict[str, Any]:
     - performed_station_ae_title: AE title of the performing modality
     - accession_number: From the Scheduled Step Attributes Sequence
     - study_instance_uid: From the Scheduled Step Attributes Sequence
+
+    Issue #24: also extracts PerformedSeriesSequence and additional
+    procedure-step timing / protocol fields:
+    - performed_series_sequence: serialised list of series-level data
+    - performed_protocol_code_sequence: list of code items
+    - performed_procedure_step_start_date / _start_time
+    - performed_procedure_step_end_date / _end_time
+    - performed_procedure_step_description
+    - comments_on_performed_procedure_step
     """
     data: dict[str, Any] = {}
 
@@ -111,6 +121,81 @@ def extract_mpps_data(dataset: Dataset) -> dict[str, Any]:
         if study_uid:
             data["study_instance_uid"] = str(study_uid).strip()
 
+    # ---------------------------------------------------------------
+    # Issue #24 — additional attributes
+    # ---------------------------------------------------------------
+
+    # Timing fields
+    for field, key in (
+        ("PerformedProcedureStepStartDate", "performed_procedure_step_start_date"),
+        ("PerformedProcedureStepStartTime", "performed_procedure_step_start_time"),
+        ("PerformedProcedureStepEndDate", "performed_procedure_step_end_date"),
+        ("PerformedProcedureStepEndTime", "performed_procedure_step_end_time"),
+    ):
+        val = getattr(dataset, field, None)
+        if val is not None:
+            data[key] = str(val).strip()
+
+    # Free-text description and comments
+    description = getattr(dataset, "PerformedProcedureStepDescription", None)
+    if description is not None:
+        data["performed_procedure_step_description"] = str(description).strip()
+
+    comments = getattr(dataset, "CommentsOnThePerformedProcedureStep", None)
+    if comments is not None:
+        data["comments_on_performed_procedure_step"] = str(comments).strip()
+
+    # PerformedProtocolCodeSequence — list of code items
+    ppc_seq = getattr(dataset, "PerformedProtocolCodeSequence", None)
+    if ppc_seq is not None:
+        codes: list[dict[str, str]] = []
+        for item in ppc_seq:
+            codes.append(
+                {
+                    "code_value": str(getattr(item, "CodeValue", "") or ""),
+                    "coding_scheme_designator": str(
+                        getattr(item, "CodingSchemeDesignator", "") or ""
+                    ),
+                    "code_meaning": str(getattr(item, "CodeMeaning", "") or ""),
+                }
+            )
+        data["performed_protocol_code_sequence"] = codes
+
+    # PerformedSeriesSequence — list of series-level data
+    pss_seq = getattr(dataset, "PerformedSeriesSequence", None)
+    if pss_seq is not None:
+        series_list: list[dict[str, Any]] = []
+        for series_item in pss_seq:
+            series_entry: dict[str, Any] = {
+                "series_instance_uid": str(
+                    getattr(series_item, "SeriesInstanceUID", "") or ""
+                ),
+                "series_description": str(
+                    getattr(series_item, "SeriesDescription", "") or ""
+                ),
+                "performing_physicians_name": str(
+                    getattr(series_item, "PerformingPhysicianName", "") or ""
+                ),
+                "protocol_name": str(getattr(series_item, "ProtocolName", "") or ""),
+                "operators_name": str(getattr(series_item, "OperatorsName", "") or ""),
+            }
+            # Referenced Image Sequence within the series
+            ref_images = getattr(series_item, "ReferencedImageSequence", None)
+            if ref_images is not None:
+                series_entry["referenced_image_sequence"] = [
+                    {
+                        "referenced_sop_class_uid": str(
+                            getattr(img, "ReferencedSOPClassUID", "") or ""
+                        ),
+                        "referenced_sop_instance_uid": str(
+                            getattr(img, "ReferencedSOPInstanceUID", "") or ""
+                        ),
+                    }
+                    for img in ref_images
+                ]
+            series_list.append(series_entry)
+        data["performed_series_sequence"] = series_list
+
     return data
 
 
@@ -122,25 +207,40 @@ def _make_mpps_response(dataset: Dataset) -> Dataset:
 
 def _validate_required_attrs(
     dataset: Dataset, required: tuple[str, ...], context: str, sop_uid: str
-) -> bool:
-    """Check that all required DICOM attributes are present and non-empty.
+) -> None:
+    """Assert that all required DICOM attributes are present and non-empty.
 
-    Returns True if all required attrs are present, False otherwise.
+    Issue #49: raises ValueError instead of returning bool so that callers
+    can use a try/except pattern and return the appropriate DIMSE status code
+    without having to check a return value.
+
+    Args:
+        dataset: The DICOM dataset to inspect.
+        required: Attribute names that must be present and non-empty.
+        context: Human-readable context label for error messages.
+        sop_uid: SOP Instance UID for log correlation.
+
+    Raises:
+        ValueError: If one or more required attributes are missing or empty.
+            The message lists all missing attribute names.
     """
+    missing: list[str] = []
     for attr in required:
         val = getattr(dataset, attr, None)
         if val is None or str(val).strip() == "":
-            logger.warning(
-                "mpps.missing_required_attr",
-                attr=attr,
-                context=context,
-                sop_instance_uid=sop_uid,
-            )
-            return False
-    return True
+            missing.append(attr)
+    if missing:
+        msg = f"MPPS {context} missing required attrs for {sop_uid}: {', '.join(missing)}"
+        logger.warning(
+            "mpps.missing_required_attrs",
+            missing=missing,
+            context=context,
+            sop_instance_uid=sop_uid,
+        )
+        raise ValueError(msg)
 
 
-class MPPSServer:
+class MPPSServer(BaseSCPServer):
     """Modality Performed Procedure Step SCP server.
 
     Uses pynetdicom to handle N-CREATE and N-SET requests. On each
@@ -150,7 +250,7 @@ class MPPSServer:
     Issue #14: Enforces the MPPS state machine:
     - N-CREATE requires status = "IN PROGRESS" (0x0110 if violated)
     - N-SET validates current->new transition (0x0110 if invalid)
-    - Duplicate N-CREATE returns 0x0110
+    - Duplicate N-CREATE returns 0x0111
 
     Args:
         ae_title: Application Entity title for this SCP.
@@ -160,9 +260,10 @@ class MPPSServer:
         loop: The asyncio event loop to run async callbacks on.
         bind_address: IP address to bind to (default ``"127.0.0.1"``).
         security: Optional DicomAssociationSecurity for AE whitelist/rate/connection limits.
-        tls_cert: Path to TLS certificate file for DICOM TLS.
-        tls_key: Path to TLS private key file for DICOM TLS.
-        tls_ca_cert: Path to CA certificate file for mutual TLS (client verification).
+        tls_cert: Path to TLS certificate file.  Empty string disables TLS.
+        tls_key: Path to TLS private key file.  Empty string disables TLS.
+        tls_ca_cert: Path to CA certificate for mutual TLS.  Empty string
+            disables client verification.
     """
 
     def __init__(
@@ -177,21 +278,48 @@ class MPPSServer:
         tls_key: str = "",
         tls_ca_cert: str = "",
     ) -> None:
-        self.ae_title = ae_title
-        self.port = port
+        super().__init__(
+            ae_title=ae_title,
+            port=port,
+            loop=loop,
+            bind_address=bind_address,
+            security=security,
+            tls_cert=tls_cert,
+            tls_key=tls_key,
+            tls_ca_cert=tls_ca_cert,
+        )
         self._status_callback = status_callback
-        self._loop = loop
-        self._bind_address = bind_address
-        self._security = security
-        self._tls_cert = tls_cert
-        self._tls_key = tls_key
-        self._tls_ca_cert = tls_ca_cert
-        self._ae: AE | None = None
         # In-memory MPPS instance store: SOP Instance UID -> Dataset
         # Used for state machine tracking; DB persistence handled via callbacks.
         self._instances: dict[str, Dataset] = {}
         # Mutex for atomic duplicate-check + store in N-CREATE (prevents TOCTOU race)
         self._create_lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # BaseSCPServer interface
+    # ------------------------------------------------------------------
+
+    def _make_ae(self) -> AE:
+        """Use this module's AE so that ``patch('...mpps_scp.AE')`` works in tests."""
+        return AE(ae_title=self.ae_title)
+
+    def _get_sop_classes_and_handlers(self) -> tuple[list[str], DicomHandlerList]:
+        return [MPPS_SOP_CLASS], [
+            (evt.EVT_N_CREATE, self._handle_n_create),
+            (evt.EVT_N_SET, self._handle_n_set),
+        ]
+
+    def _log_started(self, tls_enabled: bool) -> None:
+        logger.info(
+            "mpps.server_started",
+            ae_title=self.ae_title,
+            port=self.port,
+            tls_enabled=tls_enabled,
+        )
+
+    # ------------------------------------------------------------------
+    # State machine helpers
+    # ------------------------------------------------------------------
 
     def _current_status(self, sop_instance_uid: str) -> MPPSStatusEnum | None:
         """Return current PerformedProcedureStepStatus for a known UID, or None."""
@@ -205,6 +333,10 @@ class MPPSServer:
             return MPPSStatusEnum(str(val).strip())
         except ValueError:
             return None
+
+    # ------------------------------------------------------------------
+    # N-CREATE handler
+    # ------------------------------------------------------------------
 
     def _handle_n_create(self, event: Event) -> tuple[int, Dataset | None]:
         """Handle MPPS N-CREATE (procedure step started).
@@ -221,7 +353,7 @@ class MPPSServer:
         # Issue #14 — N-CREATE MUST carry status "IN PROGRESS" (validate first,
         # before acquiring lock, since status check has no side effects)
         requested_status = str(getattr(attr_list, "PerformedProcedureStepStatus", "")).strip()
-        if requested_status != MPPS_STATUS_IN_PROGRESS:
+        if requested_status != MPPSStatusEnum.IN_PROGRESS:
             logger.warning(
                 "mpps.invalid_initial_status",
                 sop_instance_uid=sop_instance_uid,
@@ -229,10 +361,12 @@ class MPPSServer:
             )
             return 0x0110, None
 
-        # PS3.4 F.7.2 — validate required Type 1 attributes
-        if not _validate_required_attrs(
-            attr_list, NCREATE_REQUIRED_ATTRS, "N-CREATE", sop_instance_uid
-        ):
+        # PS3.4 F.7.2 — validate required Type 1 attributes (#49: raises ValueError)
+        try:
+            _validate_required_attrs(
+                attr_list, NCREATE_REQUIRED_ATTRS, "N-CREATE", sop_instance_uid
+            )
+        except ValueError:
             return 0x0110, None
 
         # Atomic duplicate-check + store under lock to prevent TOCTOU race
@@ -259,6 +393,10 @@ class MPPSServer:
         response = _make_mpps_response(Dataset())
         return 0x0000, response
 
+    # ------------------------------------------------------------------
+    # N-SET handler
+    # ------------------------------------------------------------------
+
     def _handle_n_set(self, event: Event) -> tuple[int, Dataset | None]:
         """Handle MPPS N-SET (procedure step completed/discontinued).
 
@@ -283,7 +421,7 @@ class MPPSServer:
 
         # Issue #14 — validate state machine transition
         current = self._current_status(sop_instance_uid)
-        if current != MPPS_STATUS_IN_PROGRESS:
+        if current != MPPSStatusEnum.IN_PROGRESS:
             logger.warning(
                 "mpps.invalid_transition_from_terminal",
                 sop_instance_uid=sop_instance_uid,
@@ -300,20 +438,25 @@ class MPPSServer:
             )
             return 0x0110, None
 
-        # PS3.4 F.7.2 — COMPLETED requires end date/time
-        if new_status == MPPS_STATUS_COMPLETED and not _validate_required_attrs(
-            mod_list, NSET_COMPLETED_REQUIRED_ATTRS, "N-SET-COMPLETED", sop_instance_uid
-        ):
-            return 0x0110, None
+        # PS3.4 F.7.2 — COMPLETED requires end date/time (#49: raises ValueError)
+        if new_status == MPPSStatusEnum.COMPLETED:
+            try:
+                _validate_required_attrs(
+                    mod_list, NSET_COMPLETED_REQUIRED_ATTRS, "N-SET-COMPLETED", sop_instance_uid
+                )
+            except ValueError:
+                return 0x0110, None
 
         # PS3.4 F.7.2 — DISCONTINUED requires end date/time AND discontinuation reason
-        if new_status == MPPS_STATUS_DISCONTINUED:
-            if not _validate_required_attrs(
-                mod_list,
-                NSET_DISCONTINUED_REQUIRED_ATTRS,
-                "N-SET-DISCONTINUED",
-                sop_instance_uid,
-            ):
+        if new_status == MPPSStatusEnum.DISCONTINUED:
+            try:
+                _validate_required_attrs(
+                    mod_list,
+                    NSET_DISCONTINUED_REQUIRED_ATTRS,
+                    "N-SET-DISCONTINUED",
+                    sop_instance_uid,
+                )
+            except ValueError:
                 return 0x0110, None
             # DiscontinuationReasonCodeSequence must have at least one item
             reason_seq = getattr(
@@ -330,7 +473,6 @@ class MPPSServer:
         # to prevent irrecoverable state if callback fails (HIGH-4 fix).
         # Must use deepcopy: pydicom Dataset shallow copy shares DataElement
         # references, so add() on the working copy can mutate stored.
-
         stored = self._instances[sop_instance_uid]
         working = copy.deepcopy(stored)
         for elem in mod_list:
@@ -346,6 +488,10 @@ class MPPSServer:
 
         response = _make_mpps_response(Dataset())
         return 0x0000, response
+
+    # ------------------------------------------------------------------
+    # Callback bridge
+    # ------------------------------------------------------------------
 
     def _invoke_callback(self, mpps_uid: str, mpps_data: dict[str, Any]) -> bool:
         """Invoke the async status callback from the sync pynetdicom thread.
@@ -364,9 +510,9 @@ class MPPSServer:
                 return False
         return True
 
-    def _build_ssl_context(self) -> ssl.SSLContext | None:
-        """Build an SSL context from TLS cert/key/CA parameters."""
-        return build_dicom_ssl_context(self._tls_cert, self._tls_key, self._tls_ca_cert)
+    # ------------------------------------------------------------------
+    # Preload
+    # ------------------------------------------------------------------
 
     def preload_active_instances(self, instances: dict[str, Dataset]) -> None:
         """Preload active MPPS instances from the database on startup.
@@ -375,58 +521,50 @@ class MPPSServer:
         instances that were previously tracked can be re-loaded so that
         subsequent N-SET requests succeed.
 
+        Issue #20: only instances with status IN_PROGRESS are loaded.
+        Instances with any other status are skipped with a warning.
+
         Args:
             instances: Mapping of SOP Instance UID -> Dataset with at least
                 PerformedProcedureStepStatus set.
         """
-        self._instances.update(instances)
+        loaded = 0
+        skipped = 0
+        for uid, dataset in instances.items():
+            raw_status = str(getattr(dataset, "PerformedProcedureStepStatus", "")).strip()
+            try:
+                status = MPPSStatusEnum(raw_status)
+            except ValueError:
+                logger.warning(
+                    "mpps.preload_invalid_status",
+                    sop_instance_uid=uid,
+                    raw_status=raw_status,
+                    msg="Skipping preload — status value is not a recognised MPPSStatusEnum",
+                )
+                skipped += 1
+                continue
 
-    def start(self) -> None:
-        """Start the MPPS SCP in non-blocking mode."""
-        self._ae = AE(ae_title=self.ae_title)
-        # Issue #9 — register with all 8 supported transfer syntaxes
-        self._ae.add_supported_context(MPPS_SOP_CLASS, TRANSFER_SYNTAXES)
+            if status != MPPSStatusEnum.IN_PROGRESS:
+                logger.warning(
+                    "mpps.preload_skip_non_active",
+                    sop_instance_uid=uid,
+                    status=status,
+                    msg="Skipping preload — only IN_PROGRESS instances are preloaded",
+                )
+                skipped += 1
+                continue
 
-        handlers: list[tuple[Any, Any]] = [
-            (evt.EVT_N_CREATE, self._handle_n_create),
-            (evt.EVT_N_SET, self._handle_n_set),
-        ]
+            self._instances[uid] = dataset
+            loaded += 1
 
-        # Issue #6 — wire DicomAssociationSecurity handlers
-        if self._security:
-            handlers.extend(
-                [
-                    (evt.EVT_REQUESTED, self._security.handle_association_request),
-                    (evt.EVT_RELEASED, self._security.handle_association_released),
-                    (evt.EVT_ABORTED, self._security.handle_association_aborted),
-                ]
-            )
+        logger.info("mpps.preload_complete", loaded=loaded, skipped=skipped)
 
-        ssl_context = self._build_ssl_context()
-        if ssl_context is None:
-            logger.warning(
-                "mpps.tls_disabled",
-                ae_title=self.ae_title,
-                port=self.port,
-                msg="MPPS SCP starting without TLS — DICOM traffic is unencrypted",
-            )
-        self._ae.start_server(
-            (self._bind_address, self.port),
-            block=False,
-            ssl_context=ssl_context,
-            evt_handlers=handlers,  # type: ignore[arg-type]
-        )
-        logger.info(
-            "mpps.server_started",
-            ae_title=self.ae_title,
-            port=self.port,
-            tls_enabled=ssl_context is not None,
-        )
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def stop(self) -> None:
         """Stop the MPPS SCP."""
-        if self._ae:
-            self._ae.shutdown()
-            self._ae = None
-            self._instances.clear()
-            logger.info("mpps.server_stopped")
+        super().stop()
+        self._instances.clear()
+        logger.info("mpps.server_stopped")

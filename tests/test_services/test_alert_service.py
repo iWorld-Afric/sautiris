@@ -229,7 +229,12 @@ class TestAlertServiceDispatchFailures:
     async def test_escalate_alert_dispatch_failure_logged(
         self, db_session: AsyncSession, order: object
     ) -> None:
-        """Escalation dispatch errors are logged as CRITICAL; escalated flag is still set."""
+        """Escalation dispatch errors are logged as CRITICAL.
+
+        Per #43: when dispatch fails, the alert is NOT marked escalated=True;
+        instead notification_failed=True is set so the auto-escalation worker
+        can retry.  The alert is still returned.
+        """
         from unittest.mock import patch
 
         class _FailingDispatcher:
@@ -243,17 +248,24 @@ class TestAlertServiceDispatchFailures:
         )
 
         with patch("sautiris.services.alert_service.logger") as mock_logger:
-            escalated = await svc.escalate_alert(alert.id)
+            result = await svc.escalate_alert(alert.id)
             mock_logger.critical.assert_called()
             event_key = mock_logger.critical.call_args[0][0]
             assert "dispatch_failed" in event_key
 
-        assert escalated.escalated is True
+        # Per #43: dispatch failure means NOT escalated, but notification_failed is set
+        assert result.escalated is False
+        assert result.notification_failed is True
 
     async def test_check_escalation_dispatch_failure_logged(
         self, db_session: AsyncSession, order: object
     ) -> None:
-        """Batch escalation dispatch errors per stale alert are logged as CRITICAL."""
+        """Batch escalation dispatch errors are logged as CRITICAL.
+
+        Per #43: alerts whose notification failed during check_escalation are NOT
+        added to the returned list (they were not successfully escalated), but
+        logger.critical is still called and notification_failed is set on the alert.
+        """
         from unittest.mock import patch
 
         class _FailingDispatcher:
@@ -277,7 +289,8 @@ class TestAlertServiceDispatchFailures:
             escalated_list = await svc.check_escalation()
             mock_logger.critical.assert_called()
 
-        assert len(escalated_list) == 1
+        # Per #43: dispatch failure means NOT in escalated list, but notification_failed set
+        assert len(escalated_list) == 0
 
     async def test_create_alert_commit_failure_propagates(
         self, db_session: AsyncSession, order: object

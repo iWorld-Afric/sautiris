@@ -837,3 +837,56 @@ class TestNSetWorkingCopyPreservation:
         stored = server._instances[uid]
         stored_status = str(getattr(stored, "PerformedProcedureStepStatus", "")).strip()
         assert stored_status == "COMPLETED"
+
+
+# ---------------------------------------------------------------------------
+# #57: MPPS error message leak prevention — internal exception details must NOT
+#      propagate to the DICOM response (only a generic status code is returned)
+# ---------------------------------------------------------------------------
+
+
+class TestMPPSErrorLeakPrevention:
+    """#57: N-CREATE callback exceptions must NOT leak internal details to DICOM response.
+
+    When the status callback raises with an exception that contains sensitive
+    internal information, the MPPS server must only return a generic integer
+    status code to the DICOM peer. The raw error message must not appear in the
+    return value.
+    """
+
+    def test_n_create_callback_error_returns_only_status_code(self) -> None:
+        """Callback raising with sensitive message → only integer status tuple returned.
+
+        _handle_n_create must return (0xC001, None) — an integer + None, never
+        a string/exception that could carry internal details to the DICOM peer.
+        """
+        import asyncio
+        import threading
+
+        secret_msg = "DB conn string: postgresql://admin:prod_pass@db/ris"  # noqa: S105
+
+        async def _leaky_callback(mpps_uid: str, data: object) -> None:
+            raise RuntimeError(secret_msg)
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            server = MPPSServer(status_callback=_leaky_callback, loop=loop)
+            uid = "1.2.3.leak.test.001"
+            event = _make_n_create_event(uid, MPPS_STATUS_IN_PROGRESS)
+            status, response_ds = server._handle_n_create(event)
+
+            # Return value is a plain integer, not an exception or string
+            assert isinstance(status, int), (
+                f"Expected int DIMSE status, got {type(status)}: {status}"
+            )
+            assert status == 0xC001
+            assert response_ds is None
+
+            # The sensitive message must not appear in the status integer
+            assert secret_msg not in str(status)
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2.0)
+            loop.close()

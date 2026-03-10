@@ -4,13 +4,23 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime
+from typing import ClassVar
 
 import structlog
+from pydicom.uid import generate_uid
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sautiris.core.events import DomainEvent, EventBus, ExamCompleted, ExamStarted
+from sautiris.core.events import (
+    DomainEvent,
+    EventBus,
+    ExamCompleted,
+    ExamStarted,
+    WorklistMPPSReceived,
+    WorklistStatusChanged,
+)
 from sautiris.models.worklist import MPPSStatus, WorklistItem, WorklistStatus
 from sautiris.repositories.worklist import WorklistRepository
+from sautiris.services.mixins import EventPublisherMixin
 
 logger = structlog.get_logger(__name__)
 
@@ -30,33 +40,13 @@ class InvalidWorklistTransitionError(Exception):
     pass
 
 
-class WorklistService:
+class WorklistService(EventPublisherMixin):
+    _critical_event_types: ClassVar[tuple[type[DomainEvent], ...]] = (ExamCompleted, ExamStarted)
+
     def __init__(self, session: AsyncSession, event_bus: EventBus | None = None) -> None:
         self.session = session
         self.repo = WorklistRepository(session)
         self._event_bus = event_bus
-
-    async def _publish(self, event: DomainEvent) -> None:
-        """Publish a domain event if an event bus is configured."""
-        if self._event_bus is not None:
-            errors = await self._event_bus.publish(event)
-            if errors:
-                for exc in errors:
-                    logger.error(
-                        "event_bus.handler_error",
-                        event_type=event.event_type,
-                        error=str(exc),
-                    )
-                if isinstance(event, ExamCompleted):
-                    logger.critical(
-                        "event_bus.exam_completed_handlers_failed",
-                        event_type=event.event_type,
-                        error_count=len(errors),
-                        msg=(
-                            "ExamCompleted handlers failed — workflow-critical event "
-                            "may not have been delivered"
-                        ),
-                    )
 
     async def create_worklist_item(
         self,
@@ -77,8 +67,6 @@ class WorklistService:
         requested_procedure_description: str | None = None,
         referring_physician_name: str | None = None,
     ) -> WorklistItem:
-        from pydicom.uid import generate_uid  # noqa: PLC0415
-
         item = WorklistItem(
             order_id=order_id,
             schedule_slot_id=schedule_slot_id,
@@ -148,14 +136,30 @@ class WorklistService:
         updated = await self.repo.update(item)
 
         if new_status == WorklistStatus.IN_PROGRESS:
-            await self._emit("exam.started", updated)
+            await self._publish(
+                ExamStarted(
+                    order_id=str(updated.order_id),
+                    worklist_item_id=str(updated.id),
+                    tenant_id=updated.tenant_id,
+                )
+            )
         elif new_status == WorklistStatus.COMPLETED:
-            await self._emit("exam.completed", updated)
+            await self._publish(
+                ExamCompleted(
+                    order_id=str(updated.order_id),
+                    worklist_item_id=str(updated.id),
+                    tenant_id=updated.tenant_id,
+                )
+            )
         else:
-            await self._emit(
-                "worklist.status_changed",
-                updated,
-                extra={"from_status": old_status, "to_status": str(new_status)},
+            await self._publish(
+                WorklistStatusChanged(
+                    item_id=str(updated.id),
+                    order_id=str(updated.order_id),
+                    from_status=str(old_status),
+                    to_status=str(new_status),
+                    tenant_id=updated.tenant_id,
+                )
             )
 
         logger.info(
@@ -186,10 +190,14 @@ class WorklistService:
             item.status = WorklistStatus.DISCONTINUED
 
         updated = await self.repo.update(item)
-        await self._emit(
-            "worklist.mpps_received",
-            updated,
-            extra={"mpps_status": mpps_status, "mpps_uid": mpps_uid or ""},
+        await self._publish(
+            WorklistMPPSReceived(
+                item_id=str(updated.id),
+                order_id=str(updated.order_id),
+                mpps_status=str(mpps_status),
+                mpps_uid=mpps_uid or "",
+                tenant_id=updated.tenant_id,
+            )
         )
         logger.info("mpps_received", item_id=str(item_id), mpps_status=mpps_status)
         return updated
@@ -197,66 +205,4 @@ class WorklistService:
     async def get_stats(self) -> dict[str, int]:
         return await self.repo.get_stats()
 
-    async def _emit(
-        self,
-        event_type: str,
-        item: WorklistItem,
-        *,
-        extra: dict[str, str] | None = None,
-    ) -> None:
-        from sautiris.core.events import (  # noqa: PLC0415
-            WorklistMPPSReceived,
-            WorklistStatusChanged,
-        )
 
-        if event_type == "exam.started":
-            await self._publish(
-                ExamStarted(
-                    order_id=str(item.order_id),
-                    worklist_item_id=str(item.id),
-                    tenant_id=item.tenant_id,
-                )
-            )
-        elif event_type == "exam.completed":
-            await self._publish(
-                ExamCompleted(
-                    order_id=str(item.order_id),
-                    worklist_item_id=str(item.id),
-                    tenant_id=item.tenant_id,
-                )
-            )
-        elif event_type == "worklist.status_changed":
-            await self._publish(
-                WorklistStatusChanged(
-                    item_id=str(item.id),
-                    order_id=str(item.order_id),
-                    from_status=(extra or {}).get("from_status", ""),
-                    to_status=(extra or {}).get("to_status", ""),
-                    tenant_id=item.tenant_id,
-                )
-            )
-        elif event_type == "worklist.mpps_received":
-            await self._publish(
-                WorklistMPPSReceived(
-                    item_id=str(item.id),
-                    order_id=str(item.order_id),
-                    mpps_status=(extra or {}).get("mpps_status", ""),
-                    mpps_uid=(extra or {}).get("mpps_uid", ""),
-                    tenant_id=item.tenant_id,
-                )
-            )
-        else:
-            payload: dict[str, str] = {
-                "item_id": str(item.id),
-                "order_id": str(item.order_id),
-                "status": str(item.status),
-            }
-            if extra:
-                payload.update(extra)
-            await self._publish(
-                DomainEvent(
-                    event_type=event_type,
-                    payload=payload,
-                    tenant_id=item.tenant_id,
-                )
-            )

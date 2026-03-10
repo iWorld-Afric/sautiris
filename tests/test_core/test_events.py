@@ -216,6 +216,7 @@ class TestConcreteEvents:
     def test_critical_finding(self) -> None:
         event = CriticalFinding(
             order_id="ORD-001",
+            report_id="RPT-001",
             finding_description="Pneumothorax",
             urgency="IMMEDIATE",
         )
@@ -406,9 +407,10 @@ class TestNewTypedEvents:
     def test_order_cancelled_defaults(self) -> None:
         from sautiris.core.events import OrderCancelled
 
-        event = OrderCancelled()
+        # order_id is required by __post_init__ validation (#45)
+        event = OrderCancelled(order_id="ORD-001")
         assert event.event_type == "order.cancelled"
-        assert event.order_id == ""
+        assert event.order_id == "ORD-001"
         assert event.reason == ""
         assert event.from_status == ""
         assert event.event_id is not None
@@ -525,7 +527,10 @@ class TestNewTypedEvents:
         assert event.room_id == "CT-2"
 
     def test_new_events_cannot_override_event_type(self) -> None:
-        """All new typed events use field(init=False) so event_type is immutable."""
+        """All new typed events use field(init=False) so event_type is immutable.
+
+        Note: OrderCancelled requires order_id due to __post_init__ validation (#45).
+        """
         from sautiris.core.events import (
             OrderCancelled,
             OrderDistributed,
@@ -539,8 +544,8 @@ class TestNewTypedEvents:
             WorklistStatusChanged,
         )
 
+        # Events without __post_init__ validation can be instantiated with defaults
         for cls, expected_type in [
-            (OrderCancelled, "order.cancelled"),
             (OrderReported, "order.reported"),
             (OrderVerified, "order.verified"),
             (OrderDistributed, "order.distributed"),
@@ -553,6 +558,10 @@ class TestNewTypedEvents:
         ]:
             event = cls()
             assert event.event_type == expected_type, f"{cls.__name__} has wrong event_type"
+
+        # OrderCancelled requires order_id
+        event = OrderCancelled(order_id="ORD-001")
+        assert event.event_type == "order.cancelled"
 
 
 # ---------------------------------------------------------------------------
@@ -911,6 +920,76 @@ class TestServiceEmitsNewTypedEvents:
         assert isinstance(captured[0], ScheduleSlotCreated)
         assert captured[0].room_id == "CT-1"
         assert captured[0].modality == "CT"
+
+    # ---------------------------------------------------------------------------
+    # #55: CriticalFinding handler error → CRITICAL log via EventPublisherMixin
+    # ---------------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_critical_finding_handler_error_logs_critical(self) -> None:
+        """#55: When a CriticalFinding handler raises, mixin logs at CRITICAL level.
+
+        CriticalFinding is in ReportService._critical_event_types, so failures
+        must produce a ``event_bus.critical_event_handlers_failed`` CRITICAL log
+        via the EventPublisherMixin in sautiris.services.mixins.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from sautiris.models.report import ReportStatus
+        from sautiris.services.report_service import ReportService
+
+        bus = EventBus()
+
+        async def _failing_handler(event: object) -> None:
+            raise RuntimeError("pager service down")
+
+        # CriticalFinding is published by finalize_report() when is_critical=True
+        bus.subscribe("finding.critical", _failing_handler)
+
+        mock_session = AsyncMock()
+        svc = ReportService(mock_session, event_bus=bus)
+
+        import uuid as _uuid
+
+        mock_report = MagicMock()
+        mock_report.id = _uuid.uuid4()
+        mock_report.order_id = _uuid.uuid4()
+        mock_report.tenant_id = _uuid.uuid4()
+        mock_report.accession_number = "ACC-CRIT-001"
+        mock_report.report_status = ReportStatus.PRELIMINARY
+        mock_report.reported_by = _uuid.uuid4()
+        mock_report.is_critical = True
+        mock_report.findings = "Pneumothorax"
+        mock_report.impression = "Urgent"
+        mock_report.body = None
+        mock_report.approved_by = None
+        mock_report.approved_by_name = None
+        mock_report.approved_at = None
+
+        svc.report_repo = AsyncMock()
+        svc.report_repo.get_by_id.return_value = mock_report
+        svc.report_repo.update.return_value = mock_report
+        svc.report_repo.get_next_version_number.return_value = 2
+        svc.report_repo.create_version.return_value = MagicMock()
+
+        approved_by = _uuid.uuid4()
+
+        # _publish logs from sautiris.services.mixins.logger
+        with patch("sautiris.services.mixins.logger") as mock_logger:
+            await svc.finalize_report(
+                mock_report.id,
+                approved_by=approved_by,
+                approved_by_name="Dr. Approver",
+            )
+            # Handler error is logged at ERROR level
+            mock_logger.error.assert_called()
+            error_key = mock_logger.error.call_args_list[0][0][0]
+            assert "event_bus.handler_error" in error_key
+
+            # CriticalFinding is a _critical_event_type — additional CRITICAL log
+            mock_logger.critical.assert_called()
+            critical_key = mock_logger.critical.call_args[0][0]
+            assert "critical_event_handlers_failed" in critical_key
 
     @pytest.mark.asyncio
     async def test_schedule_update_slot_emits_slot_updated(self) -> None:

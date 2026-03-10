@@ -255,7 +255,9 @@ class TestEvictStaleKeys:
             mw._windows[f"k{i}"] = []
         assert len(mw._windows) > _MAX_WINDOW_KEYS
 
-        mw._evict_stale_keys()
+        import time
+
+        mw._evict_stale_keys(time.monotonic())
 
         assert len(mw._windows) == 0
 
@@ -270,7 +272,7 @@ class TestEvictStaleKeys:
         mw._windows["active-1"] = [now]
         mw._windows["active-2"] = [now, now - 1]
 
-        mw._evict_stale_keys()
+        mw._evict_stale_keys(now)
 
         assert "active-1" in mw._windows
         assert "active-2" in mw._windows
@@ -279,13 +281,15 @@ class TestEvictStaleKeys:
 
     def test_no_eviction_below_threshold(self) -> None:
         """GAP-M3c: _evict_stale_keys is a no-op when len ≤ _MAX_WINDOW_KEYS."""
+        import time
+
         mw = self._make_mw()
         # Add a handful of empty buckets (well below threshold)
         for i in range(10):
             mw._windows[f"k{i}"] = []
         initial_count = len(mw._windows)
 
-        mw._evict_stale_keys()
+        mw._evict_stale_keys(time.monotonic())
 
         # No change — below threshold
         assert len(mw._windows) == initial_count

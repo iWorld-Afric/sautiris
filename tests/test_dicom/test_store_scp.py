@@ -465,3 +465,51 @@ class TestStoreSCPTimeout:
         assert server.received_count == 1
         # Confirm future.result was called with the expected timeout
         mock_future.result.assert_called_once_with(timeout=5.0)
+
+
+# ---------------------------------------------------------------------------
+# #57: Error message leak prevention — internal exception details must not
+#      propagate to the DICOM response (only a generic status code is returned)
+# ---------------------------------------------------------------------------
+
+
+class TestStoreSCPErrorLeakPrevention:
+    """#57: Callback exceptions with sensitive messages must NOT leak to DICOM response.
+
+    The DICOM status code returned by _handle_store is an integer (e.g., 0xC001).
+    No exception message, traceback, or internal details should be propagated to
+    the DICOM peer — they must only appear in server-side logs.
+    """
+
+    def test_sensitive_callback_error_returns_only_status_code(self) -> None:
+        """Callback raising with a sensitive message → only integer status code returned.
+
+        The return value of _handle_store must be 0xC001 (int), not a dict,
+        string, or exception object that could carry the error message.
+        """
+        import asyncio
+        import threading
+
+        secret_msg = "DB password is 'prod_secret_123'"  # noqa: S105
+
+        async def _leaky_callback(dicom_bytes: bytes, metadata: dict) -> None:
+            raise RuntimeError(secret_msg)
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            server = StoreSCPServer(store_callback=_leaky_callback, loop=loop)
+            event = _make_store_event()
+            status = server._handle_store(event)  # type: ignore[arg-type]
+
+            # Return value is an integer — no leak of internal message
+            assert isinstance(status, int), f"Expected int status, got {type(status)}: {status}"
+            assert status == 0xC001
+
+            # The raw exception message must NOT be present in the return value
+            assert secret_msg not in str(status)
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2.0)
+            loop.close()

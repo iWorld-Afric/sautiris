@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal, Protocol
+from typing import Any, ClassVar, Literal, Protocol
 
 import structlog
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sautiris.core.events import CriticalFinding, DomainEvent, EventBus
 from sautiris.core.tenancy import get_current_tenant_id
 from sautiris.models.alert import AlertType, AlertUrgency, CriticalAlert, NotificationMethod
 from sautiris.repositories.alert import AlertRepository
+from sautiris.services.mixins import EventPublisherMixin
 
 logger = structlog.get_logger(__name__)
 
@@ -56,8 +59,10 @@ class LoggingNotificationDispatcher:
 DEFAULT_ESCALATION_TIMEOUT = 30
 
 
-class AlertService:
+class AlertService(EventPublisherMixin):
     """Service for critical result alerting and escalation workflow."""
+
+    _critical_event_types: ClassVar[tuple[type[DomainEvent], ...]] = (CriticalFinding,)
 
     def __init__(
         self,
@@ -72,28 +77,6 @@ class AlertService:
         self._event_bus = event_bus
         self.dispatcher = notification_dispatcher or LoggingNotificationDispatcher()
         self.escalation_timeout = escalation_timeout_minutes
-
-    async def _publish(self, event: DomainEvent) -> None:
-        """Publish a domain event if an event bus is configured."""
-        if self._event_bus is not None:
-            errors = await self._event_bus.publish(event)
-            if errors:
-                for exc in errors:
-                    logger.error(
-                        "event_bus.handler_error",
-                        event_type=event.event_type,
-                        error=str(exc),
-                    )
-                if isinstance(event, CriticalFinding):
-                    logger.critical(
-                        "event_bus.critical_finding_handlers_failed",
-                        event_type=event.event_type,
-                        error_count=len(errors),
-                        msg=(
-                            "CriticalFinding handlers failed — patient safety event "
-                            "may not have been delivered"
-                        ),
-                    )
 
     async def create_alert(
         self,
@@ -207,6 +190,8 @@ class AlertService:
             "alert_acknowledged",
             alert_id=str(alert_id),
             acknowledged_by=str(user_id),
+            order_id=str(alert.order_id),
+            alert_type=str(alert.alert_type),
         )
         return updated
 
@@ -221,12 +206,12 @@ class AlertService:
         if alert.escalated:
             raise ValueError(f"Alert {alert_id} already escalated")
 
-        updated = await self.repo.escalate(alert)
-        await self.session.commit()
-
-        # Re-dispatch notification for escalation
+        # Attempt notification BEFORE committing escalation status.
+        # If dispatch fails, do NOT mark as escalated — leave for retry (#43).
         desc = alert.finding_description or "Critical finding requires attention"
         message = f"ESCALATED ALERT: {alert.alert_type} — {desc}"
+        dispatch_failed = False
+        dispatch_error: str = ""
         try:
             await self.dispatcher.dispatch(
                 method=alert.notification_method or NotificationMethod.IN_APP,
@@ -235,7 +220,9 @@ class AlertService:
                 message=message,
                 alert_id=alert_id,
             )
-        except Exception:
+        except Exception as exc:
+            dispatch_failed = True
+            dispatch_error = str(exc)
             logger.critical(
                 "alert.notification_dispatch_failed",
                 alert_id=str(alert_id),
@@ -246,6 +233,21 @@ class AlertService:
                     " — manual follow-up required"
                 ),
             )
+
+        if dispatch_failed:
+            # Track that notification failed; do not mark escalated (#43)
+            alert.notification_failed = True
+            alert.notification_error = dispatch_error
+            await self.repo.update(alert)
+            await self.session.commit()
+            logger.warning(
+                "alert_escalation_notification_failed",
+                alert_id=str(alert_id),
+            )
+            return alert
+
+        updated = await self.repo.escalate(alert)
+        await self.session.commit()
 
         logger.warning(
             "alert_escalated",
@@ -269,12 +271,34 @@ class AlertService:
         }
 
     async def check_escalation(self) -> list[CriticalAlert]:
-        """Check for alerts needing auto-escalation. Called by background worker."""
+        """Check for alerts needing auto-escalation. Called by background worker.
+
+        Candidates are unacknowledged alerts that either:
+        - have been pending longer than the escalation timeout, or
+        - previously had a notification failure and need re-notification (#44).
+        """
         cutoff = datetime.now(UTC) - timedelta(minutes=self.escalation_timeout)
         stale_alerts = await self.repo.get_unacknowledged_before(cutoff)
 
+        # Also include alerts that had notification failures — they need retry (#44).
+        # Query inline since this is a service-level concern, not a repo concern.
+        failed_stmt = select(CriticalAlert).where(
+            CriticalAlert.tenant_id == self.repo._tenant_id,
+            CriticalAlert.notification_failed.is_(True),
+            CriticalAlert.acknowledged_at.is_(None),
+        )
+        failed_result = await self.session.execute(failed_stmt)
+        failed_alerts: Sequence[CriticalAlert] = failed_result.scalars().all()
+        # Merge, deduplicating by id
+        seen_ids: set[uuid.UUID] = {a.id for a in stale_alerts}
+        candidates = list(stale_alerts)
+        for alert in failed_alerts:
+            if alert.id not in seen_ids:
+                candidates.append(alert)
+                seen_ids.add(alert.id)
+
         escalated: list[CriticalAlert] = []
-        for alert in stale_alerts:
+        for alert in candidates:
             try:
                 updated = await self.repo.escalate(alert)
             except Exception:
@@ -284,12 +308,13 @@ class AlertService:
                     exc_info=True,
                 )
                 continue
-            escalated.append(updated)
 
             message = (
                 f"AUTO-ESCALATED: {alert.alert_type}"
                 f" — unacknowledged for {self.escalation_timeout} minutes"
             )
+            dispatch_failed = False
+            dispatch_error: str = ""
             try:
                 await self.dispatcher.dispatch(
                     method=alert.notification_method or NotificationMethod.IN_APP,
@@ -298,7 +323,14 @@ class AlertService:
                     message=message,
                     alert_id=alert.id,
                 )
-            except Exception:
+                # Dispatch succeeded — clear any prior failure flag
+                updated.notification_failed = False
+                updated.notification_error = None
+            except Exception as exc:
+                dispatch_failed = True
+                dispatch_error = str(exc)
+                updated.notification_failed = True
+                updated.notification_error = dispatch_error
                 logger.critical(
                     "alert.notification_dispatch_failed",
                     alert_id=str(alert.id),
@@ -309,6 +341,9 @@ class AlertService:
                         " — manual follow-up required"
                     ),
                 )
+
+            if not dispatch_failed:
+                escalated.append(updated)
 
         if escalated:
             try:
