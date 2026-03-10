@@ -19,13 +19,8 @@ from pynetdicom import AE, evt  # AE imported here so tests can patch this modul
 from sautiris.integrations.dicom.base_scp import BaseSCPServer
 from sautiris.integrations.dicom.constants import (
     CHARSET_UTF8,
-    DEFAULT_TRANSFER_SYNTAXES,
     DicomHandlerList,
 )
-
-# Re-exported for backwards compatibility with existing imports.
-# #29: new code should import DEFAULT_TRANSFER_SYNTAXES from constants directly.
-TRANSFER_SYNTAXES = DEFAULT_TRANSFER_SYNTAXES
 
 if TYPE_CHECKING:
     from pynetdicom.events import Event
@@ -190,7 +185,7 @@ def extract_query_filters(identifier: Dataset) -> dict[str, Any]:
 
     # Check Scheduled Procedure Step Sequence for modality/AE title/date/status
     sps_seq = getattr(identifier, "ScheduledProcedureStepSequence", None)
-    if sps_seq and len(sps_seq) > 0:  # noqa: SIM102
+    if sps_seq:
         sps = sps_seq[0]
         modality = getattr(sps, "Modality", None)
         if modality and str(modality).strip():
@@ -298,7 +293,11 @@ class MWLServer(BaseSCPServer):
         identifier = event.identifier
         filters = extract_query_filters(identifier)
 
-        logger.info("mwl.c_find_request", filters=filters)
+        safe_filters = {
+            k: "[REDACTED]" if k in ("patient_name", "patient_name_pattern", "patient_id") else v
+            for k, v in filters.items()
+        }
+        logger.info("mwl.c_find_request", filters=safe_filters)
 
         items: list[WorklistItem] = []
         if self._query_callback and self._loop:

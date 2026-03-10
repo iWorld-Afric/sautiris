@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
-import secrets
 import sys
 import uuid as _uuid_mod
 from datetime import UTC, datetime
@@ -199,12 +197,12 @@ def create_apikey(
     """
     from datetime import timedelta  # noqa: PLC0415
 
-    from sqlalchemy import Column, DateTime, String, Table, create_engine  # noqa: PLC0415
-    from sqlalchemy import MetaData as SAMetaData  # noqa: PLC0415
+    from sqlalchemy import create_engine, text  # noqa: PLC0415
 
-    # Generate the raw key and its SHA-256 hash.
-    raw_key = secrets.token_urlsafe(32)
-    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    from sautiris.repositories.apikey_repo import generate_api_key  # noqa: PLC0415
+
+    # Generate the raw key, hash, and prefix using the canonical function.
+    raw_key, key_hash, key_prefix = generate_api_key()
 
     now = datetime.now(UTC)
     expires_at = now + timedelta(days=expires_in_days)
@@ -217,34 +215,29 @@ def create_apikey(
     sync_url = database_url.replace("postgresql+asyncpg://", "postgresql+psycopg2://")
 
     engine = create_engine(sync_url)
-    metadata = SAMetaData()
-    api_keys_table = Table(
-        "api_keys",
-        metadata,
-        Column("id", String),
-        Column("tenant_id", String),
-        Column("user_id", String),
-        Column("name", String),
-        Column("key_hash", String),
-        Column("scopes", String),
-        Column("expires_at", DateTime(timezone=True)),
-        Column("created_at", DateTime(timezone=True)),
-        Column("is_active", String),
-    )
 
     with engine.begin() as conn:
         conn.execute(
-            api_keys_table.insert().values(
-                id=str(key_id),
-                tenant_id=str(tenant_id),
-                user_id=str(user_id),
-                name=name,
-                key_hash=key_hash,
-                scopes=",".join(scope_list),
-                expires_at=expires_at,
-                created_at=now,
-                is_active="true",
-            )
+            text(
+                "INSERT INTO api_keys "
+                "(id, tenant_id, user_id, name, key_hash, key_prefix, "
+                "scopes, permissions, expires_at, created_at, is_active) "
+                "VALUES (:id, :tenant_id, :user_id, :name, :key_hash, :key_prefix, "
+                ":scopes, :permissions, :expires_at, :created_at, :is_active)"
+            ),
+            {
+                "id": str(key_id),
+                "tenant_id": str(tenant_id),
+                "user_id": str(user_id),
+                "name": name,
+                "key_hash": key_hash,
+                "key_prefix": key_prefix,
+                "scopes": json.dumps(scope_list),
+                "permissions": json.dumps([]),
+                "expires_at": expires_at,
+                "created_at": now,
+                "is_active": True,
+            },
         )
     engine.dispose()
 

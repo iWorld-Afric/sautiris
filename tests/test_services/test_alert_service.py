@@ -448,3 +448,67 @@ class TestCheckEscalationCommitFailure:
 
         # Must return empty list since commit failed — records not persisted
         assert escalated == []
+
+
+class TestCheckEscalationNotificationFailedPersisted:
+    """M14: verify notification_failed flag is persisted even when dispatch fails."""
+
+    async def test_notification_failed_persisted_after_escalation(
+        self, db_session: AsyncSession, order: object
+    ) -> None:
+        """When escalation dispatch fails, notification_failed is still committed."""
+
+        class _FailingDispatcher:
+            async def dispatch(self, **kwargs: object) -> None:
+                raise RuntimeError("notification service down")
+
+        svc = AlertService(
+            db_session,
+            notification_dispatcher=_FailingDispatcher(),
+            escalation_timeout_minutes=30,
+        )
+        alert = await svc.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.CRITICAL_FINDING,
+        )
+        # Backdate to exceed escalation timeout
+        alert.created_at = datetime.now(UTC) - timedelta(minutes=60)  # type: ignore[assignment]
+        await db_session.flush()
+
+        # Run escalation — dispatch will fail
+        escalated = await svc.check_escalation()
+        assert len(escalated) == 0  # not successfully escalated
+
+        # Refresh the alert from DB to verify notification_failed was persisted
+        await db_session.refresh(alert)
+        assert alert.notification_failed is True
+        assert alert.notification_error is not None
+        assert "notification service down" in alert.notification_error
+
+
+class TestCreateAlertNotificationFailedTracked:
+    """H2: verify create_alert() tracks notification failure."""
+
+    async def test_create_alert_notification_failure_sets_flags(
+        self, db_session: AsyncSession, order: object
+    ) -> None:
+        """When notification dispatch fails during create, notification_failed is set."""
+
+        class _FailingDispatcher:
+            async def dispatch(self, **kwargs: object) -> None:
+                raise RuntimeError("cannot reach notification service")
+
+        svc = AlertService(
+            db_session,
+            notification_dispatcher=_FailingDispatcher(),
+        )
+        alert = await svc.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.CRITICAL_FINDING,
+            finding_description="Test finding",
+        )
+
+        await db_session.refresh(alert)
+        assert alert.notification_failed is True
+        assert alert.notification_error is not None
+        assert "cannot reach notification service" in alert.notification_error

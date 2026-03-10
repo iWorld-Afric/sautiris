@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import structlog
 from pynetdicom import AE as _AE
@@ -108,18 +108,19 @@ class BaseSCPServer(ABC):
             handlers: The SCP-specific handlers (e.g. EVT_C_FIND).
 
         Returns:
-            Extended list including EVT_REQUESTED / EVT_RELEASED / EVT_ABORTED
+            New list including EVT_REQUESTED / EVT_RELEASED / EVT_ABORTED
             from the security instance when one is provided.
         """
+        result = list(handlers)
         if self._security:
-            handlers.extend(
+            result.extend(
                 [
                     (evt.EVT_REQUESTED, self._security.handle_association_request),
                     (evt.EVT_RELEASED, self._security.handle_association_released),
                     (evt.EVT_ABORTED, self._security.handle_association_aborted),
                 ]
             )
-        return handlers
+        return result
 
     def _log_started(self, tls_enabled: bool) -> None:
         """Log that the SCP has started.  Subclasses may override for extra fields."""
@@ -183,13 +184,3 @@ class BaseSCPServer(ABC):
             self._ae.shutdown()
             self._ae = None
             logger.info("scp.server_stopped", ae_title=self.ae_title)
-
-    # ------------------------------------------------------------------
-    # Convenience: expose DEFAULT_TRANSFER_SYNTAXES for subclasses
-    # ------------------------------------------------------------------
-
-    #: Transfer syntaxes registered for every SOP class (immutable tuple).
-    TRANSFER_SYNTAXES: tuple[str, ...] = DEFAULT_TRANSFER_SYNTAXES
-
-    # Keep a typed sentinel so subclasses can reference Any without importing it
-    _AnyType = Any

@@ -67,12 +67,6 @@ class SautiRISSettings(BaseSettings):
     dicom_tls_cert: str = ""
     dicom_tls_key: str = ""
 
-    # --- DICOM SOP class & transfer syntax configurability (Issue #25) ---
-    # Empty list = use defaults from sautiris.dicom.constants.
-    # Provide explicit UIDs to restrict or extend the supported set.
-    dicom_storage_sop_classes: list[str] = []
-    dicom_transfer_syntaxes: list[str] = []
-
     # --- FHIR ---
     fhir_base_url: str = ""
     fhir_auth_token: str = ""
@@ -161,4 +155,9 @@ class SautiRISSettings(BaseSettings):
                 "SAUTIRIS_ENCRYPTION_KEY must be set in production. "
                 'Generate one with: python -c "from cryptography.fernet import Fernet; '
                 'print(Fernet.generate_key().decode())"'
+            )
+        if self.dicom_tls_enabled and (not self.dicom_tls_cert or not self.dicom_tls_key):
+            raise ConfigurationError(
+                "dicom_tls_enabled=True requires both dicom_tls_cert and dicom_tls_key "
+                "to be set. Provide paths to the TLS certificate and private key files."
             )

@@ -168,6 +168,56 @@ class TestConfigValidation:
         )
         settings.validate_security()  # specific origins with credentials is OK
 
+    def test_dicom_tls_enabled_without_cert_raises(self) -> None:
+        """M16/H9: dicom_tls_enabled=True without cert/key raises ConfigurationError."""
+        from sautiris.config import ConfigurationError, SautiRISSettings
+
+        settings = SautiRISSettings(
+            dicom_tls_enabled=True,
+            dicom_tls_cert="",
+            dicom_tls_key="",
+            database_url="sqlite+aiosqlite:///:memory:",
+        )
+        with pytest.raises(ConfigurationError, match="dicom_tls_cert"):
+            settings.validate_security()
+
+    def test_dicom_tls_enabled_without_key_raises(self) -> None:
+        """dicom_tls_enabled=True with cert but no key raises ConfigurationError."""
+        from sautiris.config import ConfigurationError, SautiRISSettings
+
+        settings = SautiRISSettings(
+            dicom_tls_enabled=True,
+            dicom_tls_cert="/path/to/cert.pem",
+            dicom_tls_key="",
+            database_url="sqlite+aiosqlite:///:memory:",
+        )
+        with pytest.raises(ConfigurationError, match="dicom_tls_key"):
+            settings.validate_security()
+
+    def test_dicom_tls_enabled_with_cert_and_key_ok(self) -> None:
+        """dicom_tls_enabled=True with both cert and key passes validation."""
+        from sautiris.config import SautiRISSettings
+
+        settings = SautiRISSettings(
+            dicom_tls_enabled=True,
+            dicom_tls_cert="/path/to/cert.pem",
+            dicom_tls_key="/path/to/key.pem",
+            database_url="sqlite+aiosqlite:///:memory:",
+        )
+        settings.validate_security()  # should not raise
+
+    def test_dicom_tls_disabled_without_cert_ok(self) -> None:
+        """dicom_tls_enabled=False without cert/key passes validation."""
+        from sautiris.config import SautiRISSettings
+
+        settings = SautiRISSettings(
+            dicom_tls_enabled=False,
+            dicom_tls_cert="",
+            dicom_tls_key="",
+            database_url="sqlite+aiosqlite:///:memory:",
+        )
+        settings.validate_security()  # should not raise
+
 
 # ---------------------------------------------------------------------------
 # R2-H9: Corrupted Fernet ciphertext handling

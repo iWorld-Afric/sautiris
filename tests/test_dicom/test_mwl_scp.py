@@ -10,10 +10,10 @@ from types import SimpleNamespace
 
 from pydicom.dataset import Dataset
 
+from sautiris.integrations.dicom.constants import DEFAULT_TRANSFER_SYNTAXES as TRANSFER_SYNTAXES
 from sautiris.integrations.dicom.mwl_scp import (
     CHARSET_UTF8,
     MWL_FIND_SOP_CLASS,
-    TRANSFER_SYNTAXES,
     MWLServer,
     extract_query_filters,
     worklist_item_to_dataset,
@@ -777,3 +777,90 @@ class TestStudyInstanceUIDRoundTrip:
         uid_a = str(ds_a.StudyInstanceUID)
         uid_b = str(ds_b.StudyInstanceUID)
         assert uid_a != uid_b, f"Two distinct items must receive distinct UIDs, got same: {uid_a!r}"
+
+
+# ---------------------------------------------------------------------------
+# M17: BaseSCPServer _build_handler_list immutability
+# ---------------------------------------------------------------------------
+
+
+class TestBuildHandlerListImmutability:
+    """M17/H12: _build_handler_list must NOT mutate the input list."""
+
+    def test_does_not_mutate_input(self) -> None:
+        from unittest.mock import MagicMock
+
+        from sautiris.integrations.dicom.security import DicomAssociationSecurity
+
+        security = MagicMock(spec=DicomAssociationSecurity)
+        server = MWLServer(security=security)
+        original = [("evt_c_find", lambda e: None)]
+        original_copy = list(original)
+        result = server._build_handler_list(original)
+        # Original must be unchanged
+        assert original == original_copy
+        # Result must contain the original handler + security handlers
+        assert len(result) > len(original_copy)
+
+
+# ---------------------------------------------------------------------------
+# M18: extract_query_filters exact patient name case
+# ---------------------------------------------------------------------------
+
+
+class TestExtractQueryFiltersExactPatientName:
+    """M18/C2: extract_query_filters with non-wildcard patient name."""
+
+    def test_exact_patient_name(self) -> None:
+        ds = Dataset()
+        ds.PatientName = "Smith^John"
+        filters = extract_query_filters(ds)
+        assert filters.get("patient_name") == "Smith^John"
+        assert "patient_name_pattern" not in filters
+
+    def test_wildcard_patient_name(self) -> None:
+        ds = Dataset()
+        ds.PatientName = "Smith*"
+        filters = extract_query_filters(ds)
+        assert "patient_name" not in filters
+        assert filters.get("patient_name_pattern") == "Smith%"
+
+    def test_question_mark_wildcard(self) -> None:
+        ds = Dataset()
+        ds.PatientName = "Sm?th"
+        filters = extract_query_filters(ds)
+        assert "patient_name" not in filters
+        assert filters.get("patient_name_pattern") == "Sm_th"
+
+
+# ---------------------------------------------------------------------------
+# M20: MWL _handle_find logging sanitization
+# ---------------------------------------------------------------------------
+
+
+class TestHandleFindLoggingSanitization:
+    """M20/M1: verify patient data is redacted in logs."""
+
+    def test_filters_are_sanitized_for_logging(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        server = MWLServer()
+
+        # Create a C-FIND event with patient name
+        ds = Dataset()
+        ds.PatientName = "Smith^John"
+        ds.PatientID = "PAT001"
+        event = MagicMock()
+        event.identifier = ds
+
+        with patch("sautiris.integrations.dicom.mwl_scp.logger") as mock_logger:
+            # _handle_find is a generator, consume it
+            list(server._handle_find(event))
+            mock_logger.info.assert_called()
+            call_kwargs = mock_logger.info.call_args[1]
+            logged_filters = call_kwargs.get("filters", {})
+            # Patient data should be redacted
+            if "patient_name" in logged_filters:
+                assert logged_filters["patient_name"] == "[REDACTED]"
+            if "patient_id" in logged_filters:
+                assert logged_filters["patient_id"] == "[REDACTED]"

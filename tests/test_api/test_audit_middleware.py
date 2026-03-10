@@ -440,8 +440,8 @@ class TestLogPhiAccessOperationalError:
         event_key = call_args[0][0] if call_args[0] else ""
         assert event_key == "audit_middleware.database_unreachable"
 
-    async def test_generic_exception_logs_error_not_critical(self) -> None:
-        """A non-OperationalError exception is caught by the generic except and logs ERROR."""
+    async def test_generic_exception_logs_critical(self) -> None:
+        """A non-OperationalError exception is caught by the generic except and logs CRITICAL."""
         request = self._make_request_with_user()
         response = MagicMock()
         response.status_code = 200
@@ -455,9 +455,12 @@ class TestLogPhiAccessOperationalError:
         ):
             await _log_phi_access(request, response, "test-generic-cid")
 
-        # Generic exception → logger.error (not logger.critical)
-        mock_logger.error.assert_called_once()
-        call_args = mock_logger.error.call_args
-        event_key = call_args[0][0] if call_args[0] else ""
-        assert event_key == "audit_middleware.log_failed"
-        mock_logger.critical.assert_not_called()
+        # M5: Generic exception now logs CRITICAL (audit failures are critical)
+        mock_logger.critical.assert_called()
+        # Find the call with the generic log_failed event key
+        log_failed_calls = [
+            c
+            for c in mock_logger.critical.call_args_list
+            if c[0] and c[0][0] == "audit_middleware.log_failed"
+        ]
+        assert len(log_failed_calls) == 1

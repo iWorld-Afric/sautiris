@@ -139,3 +139,32 @@ class TestOAuth2JwksCache:
 
         result = await provider._get_jwks()
         assert result == new_jwks
+
+
+# ---------------------------------------------------------------------------
+# M15: JWKS close() method tests
+# ---------------------------------------------------------------------------
+
+
+class TestJWKSClose:
+    """M15: verify close() properly closes the HTTP client."""
+
+    async def test_close_with_client(self) -> None:
+        provider = KeycloakAuthProvider(
+            server_url="https://auth.example.com",
+            realm="test",
+            client_id="app",
+        )
+        mock_client = AsyncMock()
+        provider._jwks_client = mock_client
+        await provider.close()
+        mock_client.aclose.assert_awaited_once()
+
+    async def test_close_without_client(self) -> None:
+        provider = OAuth2AuthProvider(
+            jwks_url="https://auth.example.com/.well-known/jwks.json",
+            issuer="https://auth.example.com",
+            audience="app",
+        )
+        assert provider._jwks_client is None
+        await provider.close()  # should not raise

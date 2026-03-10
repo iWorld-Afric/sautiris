@@ -175,7 +175,7 @@ async def _log_phi_access(
             msg="HIPAA audit log write failed — database unreachable",
         )
     except Exception:
-        logger.error("audit_middleware.log_failed", exc_info=True)
+        logger.critical("audit_middleware.log_failed", exc_info=True)
 
 
 def _resource_type_from_path(path: str) -> str:

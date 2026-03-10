@@ -10,7 +10,7 @@ import pytest
 from cryptography.fernet import Fernet
 from sqlalchemy import Column, MetaData, String, Table, create_engine, text
 
-from sautiris.core.crypto import rotate_encryption_key
+from sautiris.core.crypto import rotate_encryption_key_detailed
 
 _FERNET_PREFIX = "gAAAAAB"
 
@@ -62,7 +62,7 @@ class TestRotateEncryptionKey:
             )
 
         with engine_with_tables.begin() as conn:
-            count = rotate_encryption_key(conn, old_key, new_key)
+            count = rotate_encryption_key_detailed(conn, old_key, new_key).rotated_count
 
         assert count == 1
 
@@ -94,7 +94,7 @@ class TestRotateEncryptionKey:
             )
 
         with engine_with_tables.begin() as conn:
-            count = rotate_encryption_key(conn, old_key, new_key)
+            count = rotate_encryption_key_detailed(conn, old_key, new_key).rotated_count
 
         # 2 values re-encrypted (api_key + webhook_secret)
         assert count == 2
@@ -116,7 +116,7 @@ class TestRotateEncryptionKey:
             )
 
         with engine_with_tables.begin() as conn:
-            count = rotate_encryption_key(conn, old_key, new_key)
+            count = rotate_encryption_key_detailed(conn, old_key, new_key).rotated_count
 
         assert count == 0
 
@@ -136,7 +136,7 @@ class TestRotateEncryptionKey:
             )
 
         with engine_with_tables.begin() as conn:
-            count = rotate_encryption_key(conn, old_key, new_key)
+            count = rotate_encryption_key_detailed(conn, old_key, new_key).rotated_count
 
         assert count == 0
 
@@ -145,7 +145,7 @@ class TestRotateEncryptionKey:
     ) -> None:
         """No rows in either table → count is 0."""
         with engine_with_tables.begin() as conn:
-            count = rotate_encryption_key(conn, old_key, new_key)
+            count = rotate_encryption_key_detailed(conn, old_key, new_key).rotated_count
         assert count == 0
 
 

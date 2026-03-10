@@ -119,7 +119,11 @@ class AlertService(EventPublisherMixin):
                 message=message,
                 alert_id=created.id,
             )
-        except Exception:
+        except Exception as exc:
+            created.notification_failed = True
+            created.notification_error = str(exc)
+            await self.repo.update(created)
+            await self.session.flush()
             logger.critical(
                 "alert.notification_dispatch_failed",
                 alert_id=str(created.id),
@@ -283,7 +287,7 @@ class AlertService(EventPublisherMixin):
         # Also include alerts that had notification failures — they need retry (#44).
         # Query inline since this is a service-level concern, not a repo concern.
         failed_stmt = select(CriticalAlert).where(
-            CriticalAlert.tenant_id == self.repo._tenant_id,
+            CriticalAlert.tenant_id == get_current_tenant_id(),
             CriticalAlert.notification_failed.is_(True),
             CriticalAlert.acknowledged_at.is_(None),
         )
@@ -298,6 +302,7 @@ class AlertService(EventPublisherMixin):
                 seen_ids.add(alert.id)
 
         escalated: list[CriticalAlert] = []
+        any_modified = False
         for alert in candidates:
             try:
                 updated = await self.repo.escalate(alert)
@@ -331,6 +336,7 @@ class AlertService(EventPublisherMixin):
                 dispatch_error = str(exc)
                 updated.notification_failed = True
                 updated.notification_error = dispatch_error
+                any_modified = True
                 logger.critical(
                     "alert.notification_dispatch_failed",
                     alert_id=str(alert.id),
@@ -345,7 +351,7 @@ class AlertService(EventPublisherMixin):
             if not dispatch_failed:
                 escalated.append(updated)
 
-        if escalated:
+        if escalated or any_modified:
             try:
                 await self.session.commit()
             except Exception:
@@ -356,8 +362,9 @@ class AlertService(EventPublisherMixin):
                     msg="Failed to persist auto-escalation records — manual follow-up required",
                 )
                 return []
-            logger.warning(
-                "auto_escalation_completed",
-                escalated_count=len(escalated),
-            )
+            if escalated:
+                logger.warning(
+                    "auto_escalation_completed",
+                    escalated_count=len(escalated),
+                )
         return escalated

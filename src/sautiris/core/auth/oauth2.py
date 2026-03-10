@@ -13,9 +13,6 @@ from sautiris.core.auth.jwks_base import JWKSAuthProviderBase
 
 logger = structlog.get_logger(__name__)
 
-# Re-export for consumers that import MAX_STALE_AGE from this module
-from sautiris.core.auth.jwks_base import MAX_STALE_AGE as MAX_STALE_AGE  # noqa: E402
-
 
 class OAuth2AuthProvider(JWKSAuthProviderBase):
     """Generic OAuth2 bearer token verification via JWKS with TTL cache and key-miss refetch."""

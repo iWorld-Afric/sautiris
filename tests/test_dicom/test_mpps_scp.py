@@ -10,17 +10,18 @@ from unittest.mock import MagicMock
 
 from pydicom.dataset import Dataset
 
+from sautiris.integrations.dicom.constants import DEFAULT_TRANSFER_SYNTAXES as TRANSFER_SYNTAXES
 from sautiris.integrations.dicom.mpps_scp import (
     CHARSET_UTF8,
     MPPS_SOP_CLASS,
-    MPPS_STATUS_COMPLETED,
-    MPPS_STATUS_DISCONTINUED,
-    MPPS_STATUS_IN_PROGRESS,
-    TRANSFER_SYNTAXES,
     MPPSServer,
     extract_mpps_data,
 )
 from sautiris.models.mpps import MPPSStatusEnum
+
+MPPS_STATUS_IN_PROGRESS = MPPSStatusEnum.IN_PROGRESS
+MPPS_STATUS_COMPLETED = MPPSStatusEnum.COMPLETED
+MPPS_STATUS_DISCONTINUED = MPPSStatusEnum.DISCONTINUED
 
 
 class TestExtractMPPSData:

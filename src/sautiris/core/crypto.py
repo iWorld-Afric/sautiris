@@ -124,22 +124,6 @@ class KeyRotationResult:
     skipped_count: int
 
 
-def rotate_encryption_key(
-    conn: Connection,
-    old_key: str,
-    new_key: str,
-) -> int:
-    """Re-encrypt all credential columns from *old_key* to *new_key*.
-
-    Operates within the caller's transaction — the caller is responsible
-    for committing or rolling back.
-
-    Returns the number of values re-encrypted.
-    """
-    result = rotate_encryption_key_detailed(conn, old_key, new_key)
-    return result.rotated_count
-
-
 def rotate_encryption_key_detailed(
     conn: Connection,
     old_key: str,

@@ -30,6 +30,7 @@ class WorklistRepository(TenantAwareRepository[WorklistItem]):
         scheduled_station_ae_title: str | None = None,
         date_from: date | None = None,
         date_to: date | None = None,
+        patient_name: str | None = None,
         patient_name_pattern: str | None = None,
         offset: int = 0,
         limit: int = 100,
@@ -42,6 +43,7 @@ class WorklistRepository(TenantAwareRepository[WorklistItem]):
             scheduled_station_ae_title: Filter by AE title (exact match).
             date_from: Filter items scheduled on or after this date.
             date_to: Filter items scheduled on or before this date.
+            patient_name: Exact patient name match (non-wildcard C-FIND queries).
             patient_name_pattern: SQL LIKE pattern for patient name matching.
                 Already-escaped pattern produced by
                 :func:`~sautiris.integrations.dicom.mwl_scp.extract_query_filters`
@@ -78,6 +80,9 @@ class WorklistRepository(TenantAwareRepository[WorklistItem]):
         if date_to:
             base = base.where(WorklistItem.scheduled_start <= date_to)
             count_base = count_base.where(WorklistItem.scheduled_start <= date_to)
+        if patient_name:
+            base = base.where(WorklistItem.patient_name == patient_name)
+            count_base = count_base.where(WorklistItem.patient_name == patient_name)
         if patient_name_pattern:
             # Pattern is already escaped + converted from DICOM wildcards in
             # extract_query_filters(); apply directly as a case-insensitive LIKE.

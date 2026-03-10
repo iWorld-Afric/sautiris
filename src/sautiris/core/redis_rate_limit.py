@@ -29,6 +29,24 @@ import structlog
 logger = structlog.get_logger(__name__)
 
 
+def _mask_redis_url(url: str) -> str:
+    """Mask credentials in a Redis URL for safe logging."""
+    from urllib.parse import urlparse, urlunparse  # noqa: PLC0415
+
+    if not url or "://" not in url:
+        return "redis://****"
+    try:
+        parsed = urlparse(url)
+        if parsed.password or parsed.username:
+            masked_netloc = f"**:****@{parsed.hostname}"
+            if parsed.port:
+                masked_netloc += f":{parsed.port}"
+            return urlunparse(parsed._replace(netloc=masked_netloc))
+        return url
+    except Exception:
+        return "redis://****"
+
+
 class RedisRateLimiter:
     """Redis-backed sliding window rate limiter.
 
@@ -60,7 +78,7 @@ class RedisRateLimiter:
                 self._redis = aioredis.from_url(  # type: ignore[no-untyped-call]
                     redis_url, decode_responses=False
                 )
-                logger.info("redis_rate_limit.connected", url=redis_url)
+                logger.info("redis_rate_limit.connected", url=_mask_redis_url(redis_url))
             except ImportError:
                 logger.warning(
                     "redis_rate_limit.redis_not_installed",
@@ -132,33 +150,33 @@ class RedisRateLimiter:
         """Sliding-window counter using a Redis sorted set.
 
         Algorithm:
-        1. Add the current timestamp as both score and member (with a unique
-           suffix to handle simultaneous requests with identical timestamps).
-        2. Remove all members outside the window (score < now - window).
-        3. Count remaining members.
-        4. Set TTL on the key to avoid unbounded growth.
+        1. Remove expired members outside the window.
+        2. Count remaining members.
+        3. If under limit, add the current request and set TTL.
+        4. If over limit, compute retry-after.
         """
         redis_key = f"ratelimit:{key}"
         now = time.time()
         window_start = now - window_seconds
 
-        # Each member is unique: "<timestamp>:<random-hex>" to allow multiple
-        # simultaneous requests from the same key without collision.
-        member = f"{now:.6f}:{secrets.token_hex(8)}"
-
+        # Phase 1: prune expired entries and count current usage
         pipe: Any = self._redis.pipeline()
-        pipe.zadd(redis_key, {member: now})
         pipe.zremrangebyscore(redis_key, "-inf", window_start)
         pipe.zcard(redis_key)
-        pipe.expire(redis_key, window_seconds * 2)
         results: list[Any] = await pipe.execute()
 
-        current_count = int(results[2])
-        allowed = current_count <= max_requests
-        if allowed:
+        current_count = int(results[1])
+
+        if current_count < max_requests:
+            # Phase 2: under limit — add this request
+            member = f"{now:.6f}:{secrets.token_hex(8)}"
+            pipe2: Any = self._redis.pipeline()
+            pipe2.zadd(redis_key, {member: now})
+            pipe2.expire(redis_key, window_seconds * 2)
+            await pipe2.execute()
             return True, 0
 
-        # Estimate retry-after: oldest entry's score + window - now.
+        # Over limit — compute retry-after from oldest entry
         oldest_entries: list[tuple[bytes, float]] = await self._redis.zrange(
             redis_key, 0, 0, withscores=True
         )

@@ -24,20 +24,9 @@ from pynetdicom import AE, evt  # AE imported here so tests can patch this modul
 from sautiris.integrations.dicom.base_scp import BaseSCPServer
 from sautiris.integrations.dicom.constants import (
     CHARSET_UTF8,
-    DEFAULT_TRANSFER_SYNTAXES,
     DicomHandlerList,
 )
 from sautiris.models.mpps import MPPSStatusEnum
-
-# Re-exported for backwards compatibility with existing imports.
-# #29: new code should import DEFAULT_TRANSFER_SYNTAXES from constants directly.
-TRANSFER_SYNTAXES = DEFAULT_TRANSFER_SYNTAXES
-
-# Issue #31 — these module-level aliases are deprecated; use MPPSStatusEnum directly.
-# Kept as re-exports so existing test imports don't break.
-MPPS_STATUS_IN_PROGRESS = MPPSStatusEnum.IN_PROGRESS
-MPPS_STATUS_COMPLETED = MPPSStatusEnum.COMPLETED
-MPPS_STATUS_DISCONTINUED = MPPSStatusEnum.DISCONTINUED
 
 if TYPE_CHECKING:
     from pynetdicom.events import Event
@@ -167,12 +156,8 @@ def extract_mpps_data(dataset: Dataset) -> dict[str, Any]:
         series_list: list[dict[str, Any]] = []
         for series_item in pss_seq:
             series_entry: dict[str, Any] = {
-                "series_instance_uid": str(
-                    getattr(series_item, "SeriesInstanceUID", "") or ""
-                ),
-                "series_description": str(
-                    getattr(series_item, "SeriesDescription", "") or ""
-                ),
+                "series_instance_uid": str(getattr(series_item, "SeriesInstanceUID", "") or ""),
+                "series_description": str(getattr(series_item, "SeriesDescription", "") or ""),
                 "performing_physicians_name": str(
                     getattr(series_item, "PerformingPhysicianName", "") or ""
                 ),
@@ -504,7 +489,15 @@ class MPPSServer(BaseSCPServer):
                 self._status_callback(mpps_uid, mpps_data), self._loop
             )
             try:
-                future.result(timeout=5.0)  # Reduced from 10 s to bound thread time
+                future.result(timeout=5.0)
+            except TimeoutError:
+                logger.warning(
+                    "mpps.callback_timeout",
+                    mpps_uid=mpps_uid,
+                    timeout_seconds=5.0,
+                    msg="MPPS callback timed out — DB update may not have completed",
+                )
+                return False
             except Exception:
                 logger.exception("mpps.callback_error", mpps_uid=mpps_uid)
                 return False

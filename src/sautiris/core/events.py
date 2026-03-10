@@ -145,9 +145,6 @@ class CriticalFinding(DomainEvent):
     def __post_init__(self) -> None:
         if not self.order_id:
             raise ValueError("order_id is required for CriticalFinding")
-        if not self.report_id and not self.alert_id:
-            # At least one of report_id or alert_id must be provided for traceability
-            pass  # Relaxed: allow either report or alert to be set independently
 
 
 @dataclass
