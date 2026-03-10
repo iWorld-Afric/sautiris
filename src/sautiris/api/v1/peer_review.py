@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
@@ -11,6 +11,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sautiris.api.deps import get_db, require_permission
 from sautiris.core.auth.base import AuthUser
+from sautiris.models.peer_review import (
+    AgreementScore,
+    DiscrepancyCategory,
+    DiscrepancySeverity,
+    ReviewType,
+)
 from sautiris.services.peer_review_service import PeerReviewService
 
 router = APIRouter(prefix="/peer-review", tags=["peer-review"])
@@ -25,12 +31,12 @@ class PeerReviewCreateRequest(BaseModel):
     reviewer_id: uuid.UUID
     reviewer_name: str | None = None
     original_reporter_id: uuid.UUID | None = None
-    review_type: str = "RANDOM"
+    review_type: ReviewType = ReviewType.RANDOM
 
 
 class DiscrepancyCreateRequest(BaseModel):
-    severity: str
-    category: str
+    severity: DiscrepancySeverity
+    category: DiscrepancyCategory
     description: str | None = None
     clinical_impact: str | None = None
 
@@ -38,13 +44,13 @@ class DiscrepancyCreateRequest(BaseModel):
 class DiscrepancyResponse(BaseModel):
     id: uuid.UUID
     peer_review_id: uuid.UUID
-    severity: str
-    category: str
+    severity: DiscrepancySeverity
+    category: DiscrepancyCategory
     description: str | None
     clinical_impact: str | None
     resolution: str | None
-    resolved_at: str | None
-    created_at: str
+    resolved_at: datetime | None
+    created_at: datetime
 
     model_config = {"from_attributes": True}
 
@@ -56,11 +62,11 @@ class PeerReviewResponse(BaseModel):
     reviewer_id: uuid.UUID
     reviewer_name: str | None
     original_reporter_id: uuid.UUID | None
-    review_type: str
-    agreement_score: str | None
+    review_type: ReviewType
+    agreement_score: AgreementScore | None
     comments: str | None
-    reviewed_at: str | None
-    created_at: str
+    reviewed_at: datetime | None
+    created_at: datetime
 
     model_config = {"from_attributes": True}
 
@@ -94,7 +100,7 @@ async def create_review(
     body: PeerReviewCreateRequest,
     db: AsyncSession = Depends(get_db),
     user: AuthUser = Depends(require_permission("peer_review:create")),
-) -> Any:
+) -> object:
     """Create a new peer review assignment."""
     svc = PeerReviewService(db)
     return await svc.create_review(
@@ -111,12 +117,12 @@ async def create_review(
 async def list_reviews(
     db: AsyncSession = Depends(get_db),
     user: AuthUser = Depends(require_permission("peer_review:read")),
-    review_type: str | None = Query(default=None),
-    agreement_score: str | None = Query(default=None),
+    review_type: ReviewType | None = Query(default=None),
+    agreement_score: AgreementScore | None = Query(default=None),
     reviewer_id: uuid.UUID | None = Query(default=None),
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=200),
-) -> Any:
+) -> object:
     """List peer reviews with filtering."""
     svc = PeerReviewService(db)
     return await svc.list_reviews(
@@ -132,7 +138,7 @@ async def list_reviews(
 async def review_stats(
     db: AsyncSession = Depends(get_db),
     user: AuthUser = Depends(require_permission("peer_review:read")),
-) -> Any:
+) -> object:
     """Get peer review QA statistics."""
     svc = PeerReviewService(db)
     return await svc.get_stats()
@@ -143,7 +149,7 @@ async def radiologist_scorecard(
     radiologist_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: AuthUser = Depends(require_permission("peer_review:read")),
-) -> Any:
+) -> object:
     """Get performance scorecard for a radiologist."""
     svc = PeerReviewService(db)
     return await svc.get_scorecard(radiologist_id)
@@ -154,7 +160,7 @@ async def get_review(
     review_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: AuthUser = Depends(require_permission("peer_review:read")),
-) -> Any:
+) -> object:
     """Get a single peer review with discrepancies."""
     svc = PeerReviewService(db)
     review = await svc.get_review(review_id)
@@ -176,7 +182,7 @@ async def report_discrepancy(
     body: DiscrepancyCreateRequest,
     db: AsyncSession = Depends(get_db),
     user: AuthUser = Depends(require_permission("peer_review:create")),
-) -> Any:
+) -> object:
     """Report a discrepancy for a peer review."""
     svc = PeerReviewService(db)
     try:

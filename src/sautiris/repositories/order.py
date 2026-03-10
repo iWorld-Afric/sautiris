@@ -8,7 +8,7 @@ from datetime import date
 
 from sqlalchemy import String, cast, func, select
 
-from sautiris.models.order import RadiologyOrder
+from sautiris.models.order import OrderStatus, RadiologyOrder, Urgency
 from sautiris.repositories.base import TenantAwareRepository
 
 
@@ -35,8 +35,8 @@ class OrderRepository(TenantAwareRepository[RadiologyOrder]):
         self,
         *,
         modality: str | None = None,
-        status: str | None = None,
-        urgency: str | None = None,
+        status: OrderStatus | None = None,
+        urgency: Urgency | None = None,
         patient_id: uuid.UUID | None = None,
         date_from: date | None = None,
         date_to: date | None = None,

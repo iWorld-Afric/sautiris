@@ -7,7 +7,7 @@ from datetime import date
 from sqlalchemy import func, select
 
 from sautiris.models.analytics import TATMetric
-from sautiris.models.order import RadiologyOrder
+from sautiris.models.order import RadiologyOrder, Urgency
 from sautiris.repositories.base import TenantAwareRepository
 
 
@@ -18,7 +18,7 @@ class TATMetricRepository(TenantAwareRepository[TATMetric]):
         self,
         *,
         modality: str | None = None,
-        urgency: str | None = None,
+        urgency: Urgency | None = None,
         date_from: date | None = None,
         date_to: date | None = None,
     ) -> dict[str, object]:

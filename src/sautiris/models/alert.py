@@ -38,12 +38,12 @@ class CriticalAlert(TenantAwareBase):
     report_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("radiology_reports.id"), default=None
     )
-    alert_type: Mapped[str] = mapped_column(String(32))
+    alert_type: Mapped[AlertType] = mapped_column(String(32))
     finding_description: Mapped[str | None] = mapped_column(Text, default=None)
-    urgency: Mapped[str] = mapped_column(String(16), default=AlertUrgency.URGENT)
+    urgency: Mapped[AlertUrgency] = mapped_column(String(16), default=AlertUrgency.URGENT)
     notified_physician_id: Mapped[uuid.UUID | None] = mapped_column(default=None)
     notified_physician_name: Mapped[str | None] = mapped_column(String(255), default=None)
-    notification_method: Mapped[str | None] = mapped_column(String(16), default=None)
+    notification_method: Mapped[NotificationMethod | None] = mapped_column(String(16), default=None)
     notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     acknowledged_by: Mapped[uuid.UUID | None] = mapped_column(default=None)

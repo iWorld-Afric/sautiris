@@ -7,6 +7,8 @@ from fastapi import APIRouter
 from sautiris.api.v1 import (
     alerts,
     analytics,
+    apikeys,
+    audit,
     billing,
     dose,
     health,
@@ -19,6 +21,7 @@ from sautiris.api.v1 import (
 
 api_router = APIRouter()
 api_router.include_router(health.router)
+api_router.include_router(apikeys.router)
 api_router.include_router(orders.router)
 api_router.include_router(schedule.router)
 api_router.include_router(reports.router)
@@ -28,3 +31,4 @@ api_router.include_router(analytics.router)
 api_router.include_router(alerts.router)
 api_router.include_router(peer_review.router)
 api_router.include_router(dose.router)
+api_router.include_router(audit.router)

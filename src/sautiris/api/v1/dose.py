@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, Query, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sautiris.api.deps import get_db, require_permission
+from sautiris.api.deps import get_db, get_event_bus, require_permission
 from sautiris.core.auth.base import AuthUser
+from sautiris.core.events import EventBus
+from sautiris.models.dose import DoseSource
 from sautiris.services.dose_service import DoseService
 
 router = APIRouter(prefix="/dose", tags=["dose"])
@@ -22,17 +24,17 @@ router = APIRouter(prefix="/dose", tags=["dose"])
 class DoseRecordRequest(BaseModel):
     order_id: uuid.UUID
     modality: str
-    source: str = "MANUAL"
+    source: DoseSource = DoseSource.MANUAL
     study_instance_uid: str | None = None
-    ctdi_vol: float | None = None
-    dlp: float | None = None
-    dap: float | None = None
-    effective_dose: float | None = None
-    entrance_dose: float | None = None
-    num_exposures: int | None = None
-    kvp: float | None = None
-    tube_current_ma: float | None = None
-    exposure_time_ms: float | None = None
+    ctdi_vol: float | None = Field(default=None, ge=0)
+    dlp: float | None = Field(default=None, ge=0)
+    dap: float | None = Field(default=None, ge=0)
+    effective_dose: float | None = Field(default=None, ge=0)
+    entrance_dose: float | None = Field(default=None, ge=0)
+    num_exposures: int | None = Field(default=None, ge=1)
+    kvp: float | None = Field(default=None, ge=0)
+    tube_current_ma: float | None = Field(default=None, ge=0)
+    exposure_time_ms: float | None = Field(default=None, ge=0)
     protocol_name: str | None = None
     body_part: str | None = None
 
@@ -54,10 +56,10 @@ class DoseRecordResponse(BaseModel):
     protocol_name: str | None
     body_part: str | None
     exceeds_drl: bool | None
-    source: str
+    source: DoseSource
     recorded_by: uuid.UUID | None
-    recorded_at: str | None
-    created_at: str
+    recorded_at: datetime | None
+    created_at: datetime
 
     model_config = {"from_attributes": True}
 
@@ -85,10 +87,11 @@ class DRLComplianceResponse(BaseModel):
 async def record_dose(
     body: DoseRecordRequest,
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("dose:record")),
-) -> Any:
+) -> object:
     """Record a radiation dose."""
-    svc = DoseService(db)
+    svc = DoseService(db, event_bus=event_bus)
     return await svc.record_dose(
         order_id=body.order_id,
         modality=body.modality,
@@ -113,10 +116,11 @@ async def record_dose(
 async def get_order_dose(
     order_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("dose:read")),
-) -> Any:
+) -> object:
     """Get dose records for a specific order."""
-    svc = DoseService(db)
+    svc = DoseService(db, event_bus=event_bus)
     return await svc.get_order_dose(order_id)
 
 
@@ -124,30 +128,33 @@ async def get_order_dose(
 async def get_patient_dose(
     patient_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("dose:read")),
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=200),
-) -> Any:
+) -> object:
     """Get cumulative dose history for a patient."""
-    svc = DoseService(db)
+    svc = DoseService(db, event_bus=event_bus)
     return await svc.get_patient_dose_history(patient_id, offset=offset, limit=limit)
 
 
 @router.get("/stats", response_model=list[DoseStatsResponse])
 async def dose_stats(
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("dose:read")),
-) -> Any:
+) -> object:
     """Get facility dose statistics by modality."""
-    svc = DoseService(db)
+    svc = DoseService(db, event_bus=event_bus)
     return await svc.get_stats()
 
 
 @router.get("/drl-compliance", response_model=DRLComplianceResponse)
 async def drl_compliance(
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("dose:read")),
-) -> Any:
+) -> object:
     """Get DRL compliance report."""
-    svc = DoseService(db)
+    svc = DoseService(db, event_bus=event_bus)
     return await svc.get_drl_compliance()

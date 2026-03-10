@@ -191,3 +191,105 @@ class TestAutoEscalation:
         escalated = await svc.check_escalation()
         assert len(escalated) == 1
         assert escalated[0].escalated is True
+
+
+# ---------------------------------------------------------------------------
+# GAP: AlertService dispatch failure paths
+# ---------------------------------------------------------------------------
+
+
+class TestAlertServiceDispatchFailures:
+    """Dispatcher failures are logged as CRITICAL; commit failures propagate."""
+
+    async def test_create_alert_dispatch_failure_logged(
+        self, db_session: AsyncSession, order: object
+    ) -> None:
+        """When dispatcher raises, logger.critical is called and the alert is still created."""
+        from unittest.mock import patch
+
+        class _FailingDispatcher:
+            async def dispatch(self, **kwargs: object) -> None:
+                raise RuntimeError("SMS gateway down")
+
+        svc = AlertService(db_session, notification_dispatcher=_FailingDispatcher())
+        with patch("sautiris.services.alert_service.logger") as mock_logger:
+            alert = await svc.create_alert(
+                order_id=order.id,  # type: ignore[union-attr]
+                alert_type=AlertType.CRITICAL_FINDING,
+                finding_description="Tension pneumothorax",
+            )
+            mock_logger.critical.assert_called()
+            event_key = mock_logger.critical.call_args[0][0]
+            assert "dispatch_failed" in event_key
+
+        # Alert must still be persisted despite dispatch failure
+        assert alert.id is not None
+
+    async def test_escalate_alert_dispatch_failure_logged(
+        self, db_session: AsyncSession, order: object
+    ) -> None:
+        """Escalation dispatch errors are logged as CRITICAL; escalated flag is still set."""
+        from unittest.mock import patch
+
+        class _FailingDispatcher:
+            async def dispatch(self, **kwargs: object) -> None:
+                raise RuntimeError("email server offline")
+
+        svc = AlertService(db_session, notification_dispatcher=_FailingDispatcher())
+        alert = await svc.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.CRITICAL_FINDING,
+        )
+
+        with patch("sautiris.services.alert_service.logger") as mock_logger:
+            escalated = await svc.escalate_alert(alert.id)
+            mock_logger.critical.assert_called()
+            event_key = mock_logger.critical.call_args[0][0]
+            assert "dispatch_failed" in event_key
+
+        assert escalated.escalated is True
+
+    async def test_check_escalation_dispatch_failure_logged(
+        self, db_session: AsyncSession, order: object
+    ) -> None:
+        """Batch escalation dispatch errors per stale alert are logged as CRITICAL."""
+        from unittest.mock import patch
+
+        class _FailingDispatcher:
+            async def dispatch(self, **kwargs: object) -> None:
+                raise RuntimeError("notification service down")
+
+        svc = AlertService(
+            db_session,
+            notification_dispatcher=_FailingDispatcher(),
+            escalation_timeout_minutes=30,
+        )
+        alert = await svc.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.CRITICAL_FINDING,
+        )
+        # Backdate to exceed the 30-minute escalation timeout
+        alert.created_at = datetime.now(UTC) - timedelta(minutes=60)  # type: ignore[assignment]
+        await db_session.flush()
+
+        with patch("sautiris.services.alert_service.logger") as mock_logger:
+            escalated_list = await svc.check_escalation()
+            mock_logger.critical.assert_called()
+
+        assert len(escalated_list) == 1
+
+    async def test_create_alert_commit_failure_propagates(
+        self, db_session: AsyncSession, order: object
+    ) -> None:
+        """If session.commit raises during create_alert, the error propagates (not swallowed)."""
+        from unittest.mock import AsyncMock, patch
+
+        svc = AlertService(db_session)
+
+        with patch.object(db_session, "commit", new_callable=AsyncMock) as mock_commit:
+            mock_commit.side_effect = RuntimeError("DB connection lost")
+            with pytest.raises(RuntimeError, match="DB connection lost"):
+                await svc.create_alert(
+                    order_id=order.id,  # type: ignore[union-attr]
+                    alert_type=AlertType.CRITICAL_FINDING,
+                )

@@ -96,3 +96,40 @@ class TestCADOverlayHooks:
     def test_findings_to_overlay_empty(self) -> None:
         overlay = CADOverlayHooks.findings_to_overlay([])
         assert overlay["annotations"] == []
+
+
+# ---------------------------------------------------------------------------
+# GAP-M4, GAP-M5: AIWebhookHandler
+# ---------------------------------------------------------------------------
+
+import pytest  # noqa: E402
+from sqlalchemy.ext.asyncio import AsyncSession  # noqa: E402
+
+from sautiris.integrations.ai.hooks import AIWebhookHandler  # noqa: E402
+
+
+class TestAIWebhookHandler:
+    """Tests for AIWebhookHandler webhook validation and processing."""
+
+    async def test_validate_webhook_no_config_returns_false(
+        self, db_session: AsyncSession
+    ) -> None:
+        """GAP-M4: validate_webhook() returns False when no AIProviderConfig exists."""
+        handler = AIWebhookHandler(db_session)
+        result = await handler.validate_webhook(
+            provider_name="nonexistent_ai_provider_xyz",
+            payload=b"test-payload",
+            signature="deadbeef12345678",
+        )
+        assert result is False
+
+    async def test_process_webhook_missing_order_id_raises_value_error(
+        self, db_session: AsyncSession
+    ) -> None:
+        """GAP-M5: process_webhook() raises ValueError when order_id is absent from payload."""
+        handler = AIWebhookHandler(db_session)
+        with pytest.raises(ValueError):
+            await handler.process_webhook(
+                provider_name="test_ai_provider",
+                payload={"findings": []},  # no order_id / accession_number
+            )

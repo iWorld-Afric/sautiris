@@ -20,6 +20,8 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
+# MEDIUM-13: EventHandler uses base DomainEvent intentionally — the subscriber
+# registry must accept any domain event. Handlers narrow the type themselves.
 EventHandler = Callable[["DomainEvent"], Coroutine[Any, Any, None]]
 
 
@@ -30,7 +32,19 @@ EventHandler = Callable[["DomainEvent"], Coroutine[Any, Any, None]]
 
 @dataclass
 class DomainEvent:
-    """Base domain event."""
+    """Base domain event.
+
+    ``event_type`` and ``payload`` are required on the base class so that
+    ``DomainEvent(event_type="...", payload={...})`` still works for ad-hoc
+    events.  Concrete subclasses override ``event_type`` with
+    ``field(init=False)`` so callers cannot accidentally override the type
+    string (HIGH-5).
+
+    ``payload`` is a convenience dict for legacy consumers; typed subclasses
+    carry their data in dedicated fields instead.  Both exist to avoid a dual
+    source-of-truth: populate ``payload`` explicitly if you need it
+    (MEDIUM-11).
+    """
 
     event_type: str
     payload: dict[str, Any]
@@ -46,9 +60,15 @@ class DomainEvent:
 
 @dataclass
 class OrderCreated(DomainEvent):
-    """Emitted when a radiology order is created."""
+    """Emitted when a radiology order is created.
 
-    event_type: str = "order.created"
+    Semantically mandatory: order_id, patient_id.  Cannot enforce via required
+    fields due to Python dataclass ordering constraints with inherited defaults
+    (HIGH-6 deferred — requires test refactoring).
+    """
+
+    # HIGH-5: init=False prevents callers from overriding the event type string
+    event_type: str = field(init=False, default="order.created")
     payload: dict[str, Any] = field(default_factory=dict)
 
     # Typed convenience fields
@@ -64,7 +84,7 @@ class OrderCreated(DomainEvent):
 class OrderScheduled(DomainEvent):
     """Emitted when a radiology order is scheduled."""
 
-    event_type: str = "order.scheduled"
+    event_type: str = field(init=False, default="order.scheduled")  # HIGH-5
     payload: dict[str, Any] = field(default_factory=dict)
 
     order_id: str = ""
@@ -78,7 +98,7 @@ class OrderScheduled(DomainEvent):
 class ExamStarted(DomainEvent):
     """Emitted when an exam begins (MPPS N-CREATE)."""
 
-    event_type: str = "exam.started"
+    event_type: str = field(init=False, default="exam.started")  # HIGH-5
     payload: dict[str, Any] = field(default_factory=dict)
 
     order_id: str = ""
@@ -91,7 +111,7 @@ class ExamStarted(DomainEvent):
 class ExamCompleted(DomainEvent):
     """Emitted when an exam finishes (MPPS N-SET completed)."""
 
-    event_type: str = "exam.completed"
+    event_type: str = field(init=False, default="exam.completed")  # HIGH-5
     payload: dict[str, Any] = field(default_factory=dict)
 
     order_id: str = ""
@@ -104,7 +124,7 @@ class ExamCompleted(DomainEvent):
 class ReportFinalized(DomainEvent):
     """Emitted when a radiology report reaches FINAL status."""
 
-    event_type: str = "report.finalized"
+    event_type: str = field(init=False, default="report.finalized")  # HIGH-5
     payload: dict[str, Any] = field(default_factory=dict)
 
     order_id: str = ""
@@ -118,7 +138,7 @@ class ReportFinalized(DomainEvent):
 class CriticalFinding(DomainEvent):
     """Emitted when a critical finding is identified."""
 
-    event_type: str = "finding.critical"
+    event_type: str = field(init=False, default="finding.critical")  # HIGH-5
     payload: dict[str, Any] = field(default_factory=dict)
 
     order_id: str = ""
@@ -127,6 +147,40 @@ class CriticalFinding(DomainEvent):
     finding_description: str = ""
     urgency: str = "IMMEDIATE"
     notified_physician_id: str = ""
+
+
+@dataclass
+class DRLExceeded(DomainEvent):
+    """Emitted when a dose record exceeds Diagnostic Reference Level thresholds."""
+
+    event_type: str = field(init=False, default="dose.drl_exceeded")  # HIGH-5
+    payload: dict[str, Any] = field(default_factory=dict)
+
+    order_id: str = ""
+    dose_record_id: str = ""
+    modality: str = ""
+    body_part: str | None = None
+    ctdi_vol: float | None = None
+    dlp: float | None = None
+    dap: float | None = None
+    entrance_dose: float | None = None
+
+
+@dataclass
+class AIFindingCreated(DomainEvent):
+    """Emitted when an AI model creates a new finding on a study."""
+
+    event_type: str = field(init=False, default="ai.finding_created")  # HIGH-5
+    payload: dict[str, Any] = field(default_factory=dict)
+
+    order_id: str = ""
+    study_instance_uid: str = ""
+    finding_type: str = ""
+    # MEDIUM-12: None means confidence not reported; 0.0 was ambiguous with
+    # "zero confidence" vs "not available".
+    confidence: float | None = None
+    finding_id: str = ""
+    ai_provider: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -149,14 +203,29 @@ class EventBus:
 
     def __init__(self) -> None:
         self._handlers: dict[str, list[EventHandler]] = defaultdict(list)
+        # Tracks which handlers are marked critical (bubbles exceptions on failure)
+        self._critical: set[EventHandler] = set()
 
-    def subscribe(self, event_type: str, handler: EventHandler) -> None:
-        """Register a handler for an event type."""
+    def subscribe(
+        self, event_type: str, handler: EventHandler, *, is_critical: bool = False
+    ) -> None:
+        """Register a handler for an event type.
+
+        Args:
+            event_type: The event type string to listen for.
+            handler: Async callable that receives the event.
+            is_critical: If True, any exception raised by this handler will
+                propagate out of ``publish()``.  Non-critical handler failures
+                are logged and accumulated in the return value only.
+        """
         self._handlers[event_type].append(handler)
+        if is_critical:
+            self._critical.add(handler)
         logger.debug(
             "event_bus.subscribed",
             event_type=event_type,
             handler=getattr(handler, "__name__", repr(handler)),
+            is_critical=is_critical,
         )
 
     def unsubscribe(self, event_type: str, handler: EventHandler) -> None:
@@ -164,12 +233,22 @@ class EventBus:
         handlers = self._handlers.get(event_type, [])
         if handler in handlers:
             handlers.remove(handler)
+        self._critical.discard(handler)
 
     async def publish(self, event: DomainEvent) -> list[Exception]:
         """Publish an event to all subscribers.
 
-        Returns a list of exceptions from handlers that failed. An empty list
-        means all handlers succeeded.
+        Fan-out is always attempted for ALL handlers regardless of failures.
+        Critical handlers (registered with ``is_critical=True``) re-raise
+        their exception after fan-out completes.  Non-critical handler
+        exceptions are accumulated and returned.
+
+        Returns:
+            List of exceptions from non-critical handlers that failed.
+            An empty list means all handlers succeeded.
+
+        Raises:
+            The first exception from a *critical* handler (after full fan-out).
         """
         handlers = self._handlers.get(event.event_type, [])
         if not handlers:
@@ -188,7 +267,16 @@ class EventBus:
             return_exceptions=True,
         )
 
-        errors: list[Exception] = [r for r in results if isinstance(r, Exception)]
+        errors: list[Exception] = []
+        critical_error: Exception | None = None
+
+        for handler, result in zip(handlers, results, strict=True):
+            if isinstance(result, Exception):
+                if handler in self._critical and critical_error is None:
+                    critical_error = result
+                else:
+                    errors.append(result)
+
         if errors:
             logger.warning(
                 "event_bus.handler_errors",
@@ -196,32 +284,30 @@ class EventBus:
                 event_id=str(event.event_id),
                 error_count=len(errors),
             )
+
+        if critical_error is not None:
+            raise critical_error
+
         return errors
 
     @staticmethod
     async def _safe_call(handler: EventHandler, event: DomainEvent) -> None:
-        """Invoke handler with structured error logging."""
+        """Invoke handler; re-raise so asyncio.gather captures the exception.
+
+        Callers (service _publish methods) are responsible for logging handler
+        errors — logging here would produce duplicate log entries.
+        """
         try:
             await handler(event)
         except Exception:
-            logger.error(
-                "event_bus.handler_failed",
-                handler=getattr(handler, "__name__", repr(handler)),
-                event_type=event.event_type,
-                event_id=str(event.event_id),
-                exc_info=True,
-            )
-            raise
+            raise  # Let asyncio.gather capture it; callers log via returned errors
 
     def clear(self) -> None:
         """Remove all subscriptions."""
         self._handlers.clear()
+        self._critical.clear()
 
     @property
     def handler_count(self) -> int:
         """Total number of registered handlers across all event types."""
         return sum(len(h) for h in self._handlers.values())
-
-
-# Module-level singleton
-event_bus = EventBus()

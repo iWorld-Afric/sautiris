@@ -48,8 +48,8 @@ class PeerReview(TenantAwareBase):
     reviewer_id: Mapped[uuid.UUID] = mapped_column()
     reviewer_name: Mapped[str | None] = mapped_column(String(255), default=None)
     original_reporter_id: Mapped[uuid.UUID | None] = mapped_column(default=None)
-    review_type: Mapped[str] = mapped_column(String(32), default=ReviewType.RANDOM)
-    agreement_score: Mapped[str | None] = mapped_column(String(32), default=None)
+    review_type: Mapped[ReviewType] = mapped_column(String(32), default=ReviewType.RANDOM)
+    agreement_score: Mapped[AgreementScore | None] = mapped_column(String(32), default=None)
     comments: Mapped[str | None] = mapped_column(Text, default=None)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 
@@ -62,8 +62,8 @@ class Discrepancy(TenantAwareBase):
     __tablename__ = "discrepancies"
 
     peer_review_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("peer_reviews.id"), index=True)
-    severity: Mapped[str] = mapped_column(String(16))
-    category: Mapped[str] = mapped_column(String(32))
+    severity: Mapped[DiscrepancySeverity] = mapped_column(String(16))
+    category: Mapped[DiscrepancyCategory] = mapped_column(String(32))
     description: Mapped[str | None] = mapped_column(Text, default=None)
     clinical_impact: Mapped[str | None] = mapped_column(Text, default=None)
     resolution: Mapped[str | None] = mapped_column(Text, default=None)

@@ -202,3 +202,266 @@ async def test_list_templates(report_service: ReportService) -> None:
     await report_service.create_template(name="T2", modality="MR")
     templates = await report_service.list_templates()
     assert len(templates) == 2
+
+
+async def test_report_version_has_tenant_id(
+    report_service: ReportService, db_session: AsyncSession
+) -> None:
+    """#27 — ReportVersion must have tenant_id matching parent report's tenant."""
+    from sqlalchemy import select
+
+    from sautiris.models.report import ReportVersion
+    from tests.conftest import TEST_TENANT_ID
+
+    order = await _make_order(db_session)
+    await report_service.create_report(
+        order_id=order.id,
+        accession_number=order.accession_number,
+        reported_by=TEST_USER_ID,
+        reported_by_name="Dr. Test",
+        findings="Normal chest",
+    )
+
+    result = await db_session.execute(select(ReportVersion))
+    versions = result.scalars().all()
+    assert len(versions) >= 1
+    for v in versions:
+        assert v.tenant_id == TEST_TENANT_ID
+
+
+async def test_report_version_tenant_isolation(
+    report_service: ReportService, db_session: AsyncSession
+) -> None:
+    """#27 — ReportVersions from tenant A must not appear in tenant B queries."""
+
+    from sqlalchemy import select
+
+    from sautiris.core.tenancy import set_current_tenant_id
+    from sautiris.models.report import ReportVersion
+    from tests.conftest import TEST_TENANT_B_ID, TEST_TENANT_ID
+
+    # Create report under tenant A
+    set_current_tenant_id(TEST_TENANT_ID)
+    order = await _make_order(db_session)
+    await report_service.create_report(
+        order_id=order.id,
+        accession_number=order.accession_number,
+        reported_by=TEST_USER_ID,
+        reported_by_name="Dr. Test",
+    )
+
+    # Switch to tenant B — must see 0 ReportVersions for that tenant
+    set_current_tenant_id(TEST_TENANT_B_ID)
+    result = await db_session.execute(
+        select(ReportVersion).where(ReportVersion.tenant_id == TEST_TENANT_B_ID)
+    )
+    tenant_b_versions = result.scalars().all()
+    assert len(tenant_b_versions) == 0
+
+
+# ---------------------------------------------------------------------------
+# GAP-6: CriticalFinding event emission tests
+# ---------------------------------------------------------------------------
+
+
+async def test_finalize_critical_report_emits_critical_finding_event(
+    db_session: AsyncSession,
+) -> None:
+    """Finalizing a report with is_critical=True must emit CriticalFinding event."""
+
+    from sautiris.core.events import CriticalFinding, EventBus
+
+    # Set up event bus with a handler that captures events
+    bus = EventBus()
+    captured: list[CriticalFinding] = []
+
+    async def _capture(event: object) -> None:
+        if isinstance(event, CriticalFinding):
+            captured.append(event)
+
+    bus.subscribe("finding.critical", _capture)
+
+    service = ReportService(db_session, event_bus=bus)
+    order = await _make_order(db_session)
+    report = await service.create_report(
+        order_id=order.id,
+        accession_number=order.accession_number,
+        reported_by=TEST_USER_ID,
+        reported_by_name="Dr. Critical",
+        is_critical=True,  # critical report
+    )
+    # Advance to PRELIMINARY so we can finalize
+    report_obj = await service.get_report(report.id)
+    report_obj.report_status = ReportStatus.PRELIMINARY
+    await service.report_repo.update(report_obj)
+
+    await service.finalize_report(
+        report.id,
+        approved_by=TEST_USER_ID,
+        approved_by_name="Dr. Approver",
+    )
+
+    assert len(captured) == 1
+    assert captured[0].report_id == str(report.id)
+
+
+async def test_finalize_non_critical_report_does_not_emit_critical_finding(
+    db_session: AsyncSession,
+) -> None:
+    """Finalizing a non-critical report must NOT emit CriticalFinding event."""
+    from sautiris.core.events import CriticalFinding, EventBus
+
+    bus = EventBus()
+    captured: list[CriticalFinding] = []
+
+    async def _capture(event: object) -> None:
+        if isinstance(event, CriticalFinding):
+            captured.append(event)
+
+    bus.subscribe("finding.critical", _capture)
+
+    service = ReportService(db_session, event_bus=bus)
+    order = await _make_order(db_session)
+    report = await service.create_report(
+        order_id=order.id,
+        accession_number=order.accession_number,
+        reported_by=TEST_USER_ID,
+        reported_by_name="Dr. Normal",
+        is_critical=False,  # NOT critical
+    )
+    report_obj = await service.get_report(report.id)
+    report_obj.report_status = ReportStatus.PRELIMINARY
+    await service.report_repo.update(report_obj)
+
+    await service.finalize_report(
+        report.id,
+        approved_by=TEST_USER_ID,
+        approved_by_name="Dr. Approver",
+    )
+
+    assert len(captured) == 0  # no CriticalFinding emitted
+
+
+async def test_event_publish_errors_are_logged(
+    db_session: AsyncSession,
+) -> None:
+    """_publish logs errors when non-critical handlers raise exceptions."""
+    from unittest.mock import patch
+
+    from sautiris.core.events import EventBus
+
+    bus = EventBus()
+
+    # Register a handler that always fails
+    async def _failing_handler(event: object) -> None:
+        raise ValueError("handler error")
+
+    bus.subscribe("report.finalized", _failing_handler)
+
+    service = ReportService(db_session, event_bus=bus)
+    order = await _make_order(db_session)
+    report = await service.create_report(
+        order_id=order.id,
+        accession_number=order.accession_number,
+        reported_by=TEST_USER_ID,
+        reported_by_name="Dr. Test",
+    )
+    report_obj = await service.get_report(report.id)
+    report_obj.report_status = ReportStatus.PRELIMINARY
+    await service.report_repo.update(report_obj)
+
+    # finalize_report calls _emit("report.finalized") → _publish → handler fails
+    # _publish should log the error but NOT re-raise (non-critical handler)
+    with patch("sautiris.services.report_service.logger") as mock_logger:
+        await service.finalize_report(
+            report.id,
+            approved_by=TEST_USER_ID,
+            approved_by_name="Dr. Approver",
+        )
+        # logger.error was called with handler failure info
+        mock_logger.error.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# GAP-I6: CriticalFinding handler failure is logged at CRITICAL level
+# ---------------------------------------------------------------------------
+
+
+async def test_critical_finding_handler_failure_logged_at_critical_level(
+    db_session: AsyncSession,
+) -> None:
+    """GAP-I6: When a CriticalFinding event handler fails, _publish logs at CRITICAL level.
+
+    The ReportService._publish method must call logger.critical when any
+    CriticalFinding event handler raises — because an undelivered critical
+    finding is a patient-safety event.
+    """
+    from unittest.mock import patch
+
+    from sautiris.core.events import EventBus
+
+    bus = EventBus()
+
+    # Register a handler for CriticalFinding that always fails
+    async def _failing_critical_handler(event: object) -> None:
+        raise RuntimeError("paging system offline")
+
+    bus.subscribe("finding.critical", _failing_critical_handler)
+
+    service = ReportService(db_session, event_bus=bus)
+    order = await _make_order(db_session)
+    report = await service.create_report(
+        order_id=order.id,
+        accession_number=order.accession_number,
+        reported_by=TEST_USER_ID,
+        reported_by_name="Dr. Critical",
+        is_critical=True,
+    )
+    report_obj = await service.get_report(report.id)
+    report_obj.report_status = ReportStatus.PRELIMINARY
+    await service.report_repo.update(report_obj)
+
+    with patch("sautiris.services.report_service.logger") as mock_logger:
+        await service.finalize_report(
+            report.id,
+            approved_by=TEST_USER_ID,
+            approved_by_name="Dr. Approver",
+        )
+        # logger.critical must be called when CriticalFinding handler fails
+        mock_logger.critical.assert_called()
+        # The critical call must mention the patient-safety aspect
+        call_args = mock_logger.critical.call_args
+        event_name = call_args[0][0] if call_args[0] else str(call_args)
+        assert "critical" in event_name.lower() or "critical_finding" in event_name.lower()
+
+
+# ---------------------------------------------------------------------------
+# GAP-H5: ReportService.update_report() — unknown field warning
+# ---------------------------------------------------------------------------
+
+
+async def test_update_report_unknown_field_logs_warning(
+    report_service: ReportService, db_session: AsyncSession
+) -> None:
+    """GAP-H5: Passing an unknown field to update_report() logs a warning and does not crash."""
+    from unittest.mock import patch
+
+    order = await _make_order(db_session)
+    report = await report_service.create_report(
+        order_id=order.id,
+        accession_number=order.accession_number,
+        reported_by=TEST_USER_ID,
+        reported_by_name="Dr. Test",
+    )
+
+    with patch("sautiris.services.report_service.logger") as mock_logger:
+        updated = await report_service.update_report(
+            report.id,
+            changed_by=TEST_USER_ID,
+            bogus_field="should_be_ignored",
+        )
+
+    assert updated is not None  # no crash
+    mock_logger.warning.assert_called()
+    warning_key = mock_logger.warning.call_args[0][0]
+    assert "unknown_fields" in warning_key

@@ -8,7 +8,7 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sautiris.models.analytics import TATMetric
-from sautiris.models.order import RadiologyOrder
+from sautiris.models.order import RadiologyOrder, Urgency
 from sautiris.repositories.analytics import TATMetricRepository
 
 logger = structlog.get_logger(__name__)
@@ -67,7 +67,7 @@ class AnalyticsService:
         self,
         *,
         modality: str | None = None,
-        urgency: str | None = None,
+        urgency: Urgency | None = None,
         date_from: date | None = None,
         date_to: date | None = None,
     ) -> dict[str, object]:

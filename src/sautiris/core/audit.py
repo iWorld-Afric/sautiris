@@ -35,6 +35,7 @@ class AuditLogger:
         patient_id: uuid.UUID | None = None,
         ip_address: str = "",
         user_agent: str = "",
+        correlation_id: str | None = None,
         details: dict[str, object] | None = None,
     ) -> None:
         """Write an audit log entry."""
@@ -50,8 +51,9 @@ class AuditLogger:
             resource_type=resource_type,
             resource_id=resource_id,
             patient_id=patient_id,
-            ip_address=ip_address,
-            user_agent=user_agent,
+            ip_address=ip_address or None,
+            user_agent=user_agent or None,
+            correlation_id=correlation_id,
             details=details or {},
             created_at=now,
         )
@@ -64,4 +66,5 @@ class AuditLogger:
             resource_type=resource_type,
             resource_id=str(resource_id) if resource_id else None,
             user_id=str(user.user_id),
+            correlation_id=correlation_id,
         )

@@ -37,6 +37,6 @@ class DoseRecord(TenantAwareBase):
     protocol_name: Mapped[str | None] = mapped_column(String(255), default=None)
     body_part: Mapped[str | None] = mapped_column(String(128), default=None)
     exceeds_drl: Mapped[bool | None] = mapped_column(Boolean, default=None)
-    source: Mapped[str] = mapped_column(String(16), default=DoseSource.MANUAL)
+    source: Mapped[DoseSource] = mapped_column(String(16), default=DoseSource.MANUAL)
     recorded_by: Mapped[uuid.UUID | None] = mapped_column(default=None)
     recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)

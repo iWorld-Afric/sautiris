@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class ConfigurationError(ValueError):
+    """Raised when the application configuration is invalid."""
 
 
 class SautiRISSettings(BaseSettings):
@@ -20,7 +26,7 @@ class SautiRISSettings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
 
     # --- Auth ---
-    auth_provider: str = "keycloak"  # keycloak | oauth2 | apikey
+    auth_provider: Literal["keycloak", "oauth2", "apikey"] = "keycloak"
     keycloak_server_url: str = ""
     keycloak_realm: str = ""
     keycloak_client_id: str = ""
@@ -30,8 +36,12 @@ class SautiRISSettings(BaseSettings):
     oauth2_audience: str = ""
     api_key_header: str = "X-API-Key"
 
+    # --- JWKS Cache ---
+    jwks_cache_ttl: int = 600  # seconds; 0 = never cache
+    jwks_key_miss_refetch_interval: int = 60  # min seconds between forced refetches
+
     # --- PACS ---
-    pacs_type: str = "orthanc"  # orthanc | dcm4chee | custom
+    pacs_type: Literal["orthanc", "dcm4chee", "custom"] = "orthanc"
     orthanc_base_url: str = "http://localhost:8042"
     orthanc_dicomweb_root: str = "/dicom-web"
     orthanc_username: str = ""
@@ -44,6 +54,15 @@ class SautiRISSettings(BaseSettings):
     dicom_mpps_ae_title: str = "SAUTIRIS_MPPS"
     dicom_store_port: int = 11114
     dicom_store_ae_title: str = "SAUTIRIS_STORE"
+    # --- DICOM Security (Issue #17) ---
+    dicom_bind_address: str = "127.0.0.1"
+    dicom_ae_whitelist: list[str] | None = None  # None = allow all
+    dicom_max_connections_per_ip: int = 10
+    dicom_ip_rate_limit_per_minute: int = 60
+    dicom_tls_enabled: bool = False
+    dicom_tls_ca_cert: str = ""
+    dicom_tls_cert: str = ""
+    dicom_tls_key: str = ""
 
     # --- FHIR ---
     fhir_base_url: str = ""
@@ -53,7 +72,7 @@ class SautiRISSettings(BaseSettings):
     hl7v2_mllp_port: int = 2575
 
     # --- Viewer ---
-    viewer_type: str = "ohif"  # ohif | custom
+    viewer_type: Literal["ohif", "custom"] = "ohif"
     ohif_base_url: str = "http://localhost:3000"
     ohif_dicomweb_datasource: str = ""
 
@@ -72,10 +91,49 @@ class SautiRISSettings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8080
     workers: int = 1
-    log_level: str = "info"
-    cors_origins: list[str] = ["*"]
+    log_level: Literal["debug", "info", "warning", "error", "critical"] = "info"
+
+    # --- CORS (issue #4) ---
+    # BREAKING: default changed from ["*"] to [] — operators must configure explicitly.
+    cors_origins: list[str] = []
+    cors_allow_credentials: bool = False
+    cors_allow_methods: list[str] = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+    cors_allow_headers: list[str] = ["Authorization", "Content-Type", "X-Request-ID"]
+
+    # --- Encryption (issue #6) ---
+    # Set to a Fernet key: Fernet.generate_key().decode()
+    # Required in production; empty = no encryption (development only).
+    encryption_key: str = ""
+    environment: Literal["development", "staging", "production"] = "development"
+
+    # --- Rate limiting (issue #40) ---
+    rate_limit_enabled: bool = True
+    rate_limit_general: str = "100/minute"
+    rate_limit_auth_endpoints: str = "10/minute"
+    rate_limit_apikey_create: str = "5/minute"
+    rate_limit_trusted_ips: list[str] = []
 
     # --- Tenant ---
     default_tenant_id: str = "00000000-0000-0000-0000-000000000001"
     tenant_header: str = "X-Tenant-ID"
     tenant_jwt_claim: str = "tenant_id"
+
+    def validate_security(self) -> None:
+        """Raise ConfigurationError for invalid security settings.
+
+        Call this during application startup.  A ``@model_validator(mode='after')``
+        would auto-run this on construction, but existing tests create invalid
+        settings objects and call this method explicitly — converting would break
+        those tests.  A future refactor can migrate tests and add the decorator.
+        """
+        if "*" in self.cors_origins and self.cors_allow_credentials:
+            raise ConfigurationError(
+                "CORS wildcard origin ('*') with cors_allow_credentials=True is forbidden. "
+                "Set cors_origins to specific domains instead."
+            )
+        if self.environment == "production" and not self.encryption_key:
+            raise ConfigurationError(
+                "SAUTIRIS_ENCRYPTION_KEY must be set in production. "
+                'Generate one with: python -c "from cryptography.fernet import Fernet; '
+                'print(Fernet.generate_key().decode())"'
+            )

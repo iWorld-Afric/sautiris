@@ -9,8 +9,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sautiris.api.deps import get_db, require_permission
+from sautiris.api.deps import get_db, get_event_bus, require_permission
 from sautiris.core.auth.base import AuthUser
+from sautiris.core.events import EventBus
+from sautiris.models.worklist import MPPSStatus, WorklistStatus
 from sautiris.services.worklist_service import (
     InvalidWorklistTransitionError,
     WorklistItemNotFoundError,
@@ -33,8 +35,8 @@ class WorklistItemResponse(BaseModel):
     patient_id: str
     patient_name: str
     modality: str
-    status: str
-    mpps_status: str | None = None
+    status: WorklistStatus
+    mpps_status: MPPSStatus | None = None
     mpps_uid: str | None = None
     scheduled_start: datetime | None = None
     scheduled_station_ae_title: str | None = None
@@ -50,11 +52,11 @@ class PaginatedWorklist(BaseModel):
 
 
 class StatusUpdate(BaseModel):
-    status: str
+    status: WorklistStatus
 
 
 class MPPSUpdate(BaseModel):
-    mpps_status: str
+    mpps_status: MPPSStatus
     mpps_uid: str | None = None
 
 
@@ -64,16 +66,17 @@ class MPPSUpdate(BaseModel):
 @router.get("", response_model=PaginatedWorklist)
 async def list_worklist(
     modality: str | None = None,
-    wl_status: str | None = Query(None, alias="status"),
+    wl_status: WorklistStatus | None = Query(None, alias="status"),
     scheduled_station_ae_title: str | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(100, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("worklist:read")),
 ) -> object:
-    svc = WorklistService(db)
+    svc = WorklistService(db, event_bus=event_bus)
     items, total = await svc.list_items(
         modality=modality,
         status=wl_status,
@@ -89,9 +92,10 @@ async def list_worklist(
 @router.get("/stats")
 async def worklist_stats(
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("worklist:read")),
 ) -> dict[str, int]:
-    svc = WorklistService(db)
+    svc = WorklistService(db, event_bus=event_bus)
     return await svc.get_stats()
 
 
@@ -99,9 +103,10 @@ async def worklist_stats(
 async def get_worklist_item(
     item_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("worklist:read")),
 ) -> object:
-    svc = WorklistService(db)
+    svc = WorklistService(db, event_bus=event_bus)
     try:
         return await svc.get_item(item_id)
     except WorklistItemNotFoundError:
@@ -113,19 +118,16 @@ async def update_step_status(
     item_id: uuid.UUID,
     body: StatusUpdate,
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("worklist:update")),
 ) -> object:
-    from sautiris.models.worklist import WorklistStatus
-
-    svc = WorklistService(db)
+    svc = WorklistService(db, event_bus=event_bus)
     try:
-        return await svc.update_procedure_step_status(item_id, WorklistStatus(body.status))
+        return await svc.update_procedure_step_status(item_id, body.status)
     except WorklistItemNotFoundError:
         raise HTTPException(status_code=404, detail="Worklist item not found") from None
     except InvalidWorklistTransitionError as e:
         raise HTTPException(status_code=409, detail=str(e)) from None
-    except ValueError:
-        raise HTTPException(status_code=400, detail=f"Invalid status: {body.status}") from None
 
 
 @router.post("/{item_id}/mpps", response_model=WorklistItemResponse)
@@ -133,9 +135,10 @@ async def receive_mpps(
     item_id: uuid.UUID,
     body: MPPSUpdate,
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("worklist:update")),
 ) -> object:
-    svc = WorklistService(db)
+    svc = WorklistService(db, event_bus=event_bus)
     try:
         return await svc.receive_mpps(
             item_id,

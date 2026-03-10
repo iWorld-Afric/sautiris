@@ -56,7 +56,7 @@ class ScheduleRepository(TenantAwareRepository[ScheduleSlot]):
         room_id: str | None = None,
         modality: str | None = None,
         technologist_id: uuid.UUID | None = None,
-        status: str | None = None,
+        status: SlotStatus | None = None,
         date_from: date | None = None,
         date_to: date | None = None,
         offset: int = 0,

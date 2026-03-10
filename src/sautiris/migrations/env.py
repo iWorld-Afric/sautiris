@@ -38,10 +38,10 @@ def run_migrations_offline() -> None:
 
 def do_run_migrations(connection: object) -> None:
     context.configure(
-        connection=connection,
+        connection=connection,  # type: ignore[arg-type]
         target_metadata=target_metadata,
         version_table=version_table,
-    )  # type: ignore[arg-type]
+    )
     with context.begin_transaction():
         context.run_migrations()
 

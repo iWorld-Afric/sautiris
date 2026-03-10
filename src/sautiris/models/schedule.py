@@ -37,7 +37,7 @@ class ScheduleSlot(TenantAwareBase):
     duration_minutes: Mapped[int] = mapped_column(Integer, default=30)
     technologist_id: Mapped[uuid.UUID | None] = mapped_column(default=None)
     technologist_name: Mapped[str | None] = mapped_column(String(255), default=None)
-    status: Mapped[str] = mapped_column(String(32), default=SlotStatus.AVAILABLE)
+    status: Mapped[SlotStatus] = mapped_column(String(32), default=SlotStatus.AVAILABLE)
     notes: Mapped[str | None] = mapped_column(Text, default=None)
 
     order: Mapped[RadiologyOrder] = relationship(  # type: ignore[name-defined]  # noqa: F821

@@ -4,11 +4,21 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from enum import StrEnum
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sautiris.models.base import Base, TenantAwareBase
+
+
+class CodeSystem(StrEnum):
+    """Standard billing code systems used in radiology."""
+
+    CPT = "CPT"
+    ICD10 = "ICD-10"
+    SNOMED = "SNOMED"
+    LOINC = "LOINC"
 
 
 class BillingCode(Base):
@@ -17,7 +27,7 @@ class BillingCode(Base):
     __tablename__ = "billing_codes"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    code_system: Mapped[str] = mapped_column(String(16))
+    code_system: Mapped[CodeSystem] = mapped_column(String(16))
     code: Mapped[str] = mapped_column(String(32))
     display: Mapped[str] = mapped_column(String(512))
     modality: Mapped[str | None] = mapped_column(String(16), default=None)

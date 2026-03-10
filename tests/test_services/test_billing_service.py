@@ -134,3 +134,24 @@ async def test_revenue_summary_group_by_modality(
     result = await billing_service.get_revenue_summary(group_by="modality")
     assert len(result) >= 1
     assert "modality" in result[0]
+
+
+async def test_revenue_summary_group_by_month(
+    billing_service: BillingService, db_session: AsyncSession
+) -> None:
+    """GAP-M7: get_revenue_summary(group_by='month') groups assignments by YYYY-MM."""
+    code = await _create_billing_code(db_session, code="99213", code_system="CPT")
+    order_id = uuid.uuid4()
+    await billing_service.assign_code(order_id=order_id, billing_code_id=code.id)
+
+    result = await billing_service.get_revenue_summary(group_by="month")
+
+    assert len(result) >= 1
+    # Each row must have a "month" key formatted as YYYY-MM
+    for row in result:
+        assert "month" in row
+        month_val = row["month"]
+        assert month_val is not None
+        # strftime(%Y-%m) format: exactly 7 characters
+        assert len(str(month_val)) == 7, f"Unexpected month format: {month_val!r}"
+    assert result[0]["assignment_count"] >= 1

@@ -84,3 +84,32 @@ async def test_delete(db_session: AsyncSession) -> None:
 
     fetched = await repo.get_by_id(created.id)
     assert fetched is None
+
+
+# ---------------------------------------------------------------------------
+# GAP-M9: TenantAwareRepository.update() — persists field changes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_update_persists_field_changes(db_session: AsyncSession) -> None:
+    """GAP-M9: update() flushes changes and the updated value is readable back."""
+    repo = OrderRepository(db_session)
+    order = RadiologyOrder(
+        patient_id=uuid.uuid4(),
+        accession_number=f"ACC-{uuid.uuid4().hex[:8]}",
+        modality="CT",
+    )
+    created = await repo.create(order)
+    assert created.modality == "CT"
+
+    # Modify a field and call update()
+    created.modality = "MR"
+    updated = await repo.update(created)
+
+    assert updated.modality == "MR"
+
+    # Verify the change is persisted and readable via get_by_id
+    fetched = await repo.get_by_id(created.id)
+    assert fetched is not None
+    assert fetched.modality == "MR"

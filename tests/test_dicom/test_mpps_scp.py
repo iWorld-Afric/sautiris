@@ -1,11 +1,22 @@
-"""Tests for MPPS SCP — data extraction and server construction."""
+"""Tests for MPPS SCP — data extraction, state machine, and server construction.
+
+Covers issues: #5 (SpecificCharacterSet), #9 (transfer syntaxes),
+#14 (MPPS state machine validation).
+"""
 
 from __future__ import annotations
+
+from unittest.mock import MagicMock
 
 from pydicom.dataset import Dataset
 
 from sautiris.integrations.dicom.mpps_scp import (
+    CHARSET_UTF8,
     MPPS_SOP_CLASS,
+    MPPS_STATUS_COMPLETED,
+    MPPS_STATUS_DISCONTINUED,
+    MPPS_STATUS_IN_PROGRESS,
+    TRANSFER_SYNTAXES,
     MPPSServer,
     extract_mpps_data,
 )
@@ -114,3 +125,273 @@ class TestMPPSServer:
 
     def test_sop_class_uid(self) -> None:
         assert MPPS_SOP_CLASS == "1.2.840.10008.3.1.2.3.3"
+
+    def test_default_bind_address(self) -> None:
+        """Issue #17 — default bind must be localhost, not 0.0.0.0."""
+        server = MPPSServer()
+        assert server._bind_address == "127.0.0.1"
+
+
+def _make_n_create_event(sop_uid: str, status: str = "IN PROGRESS") -> MagicMock:
+    """Build a mock pynetdicom EVT_N_CREATE event."""
+    attr_list = Dataset()
+    attr_list.PerformedProcedureStepStatus = status
+    request = MagicMock()
+    request.AffectedSOPInstanceUID = sop_uid
+    event = MagicMock()
+    event.attribute_list = attr_list
+    event.request = request
+    return event
+
+
+def _make_n_set_event(sop_uid: str, new_status: str) -> MagicMock:
+    """Build a mock pynetdicom EVT_N_SET event."""
+    mod_list = Dataset()
+    mod_list.PerformedProcedureStepStatus = new_status
+    request = MagicMock()
+    request.RequestedSOPInstanceUID = sop_uid
+    event = MagicMock()
+    event.modification_list = mod_list
+    event.request = request
+    return event
+
+
+class TestIssue14MPPSStateMachine:
+    """Issue #14 — MPPS state machine validation."""
+
+    def test_n_create_in_progress_succeeds(self) -> None:
+        server = MPPSServer()
+        event = _make_n_create_event("1.2.3.4.1", MPPS_STATUS_IN_PROGRESS)
+        status, _ds = server._handle_n_create(event)
+        assert status == 0x0000
+        assert "1.2.3.4.1" in server._instances
+
+    def test_n_create_wrong_status_rejected(self) -> None:
+        """N-CREATE with status other than IN PROGRESS must return 0x0110."""
+        server = MPPSServer()
+        event = _make_n_create_event("1.2.3.4.2", MPPS_STATUS_COMPLETED)
+        status, ds = server._handle_n_create(event)
+        assert status == 0x0110
+        assert ds is None
+        assert "1.2.3.4.2" not in server._instances
+
+    def test_n_create_duplicate_rejected(self) -> None:
+        """Duplicate N-CREATE for existing UID must return 0x0110."""
+        server = MPPSServer()
+        uid = "1.2.3.4.3"
+        event = _make_n_create_event(uid, MPPS_STATUS_IN_PROGRESS)
+        server._handle_n_create(event)  # first create — OK
+        status, ds = server._handle_n_create(event)  # duplicate
+        assert status == 0x0110
+        assert ds is None
+
+    def test_n_set_to_completed_succeeds(self) -> None:
+        server = MPPSServer()
+        uid = "1.2.3.4.4"
+        server._handle_n_create(_make_n_create_event(uid, MPPS_STATUS_IN_PROGRESS))
+        status, _ds = server._handle_n_set(_make_n_set_event(uid, MPPS_STATUS_COMPLETED))
+        assert status == 0x0000
+
+    def test_n_set_to_discontinued_succeeds(self) -> None:
+        server = MPPSServer()
+        uid = "1.2.3.4.5"
+        server._handle_n_create(_make_n_create_event(uid, MPPS_STATUS_IN_PROGRESS))
+        status, _ds = server._handle_n_set(_make_n_set_event(uid, MPPS_STATUS_DISCONTINUED))
+        assert status == 0x0000
+
+    def test_n_set_unknown_uid_rejected(self) -> None:
+        """N-SET for unknown SOP UID must return 0x0110."""
+        server = MPPSServer()
+        event = _make_n_set_event("9.9.9.9.9", MPPS_STATUS_COMPLETED)
+        status, ds = server._handle_n_set(event)
+        assert status == 0x0110
+        assert ds is None
+
+    def test_n_set_invalid_target_status_rejected(self) -> None:
+        """N-SET with unexpected status must return 0x0110."""
+        server = MPPSServer()
+        uid = "1.2.3.4.6"
+        server._handle_n_create(_make_n_create_event(uid, MPPS_STATUS_IN_PROGRESS))
+        # Try to set to an invalid target status
+        status, ds = server._handle_n_set(_make_n_set_event(uid, "IN PROGRESS"))
+        assert status == 0x0110
+
+    def test_n_set_from_terminal_state_rejected(self) -> None:
+        """Second N-SET after COMPLETED must return 0x0110 (terminal state)."""
+        server = MPPSServer()
+        uid = "1.2.3.4.7"
+        server._handle_n_create(_make_n_create_event(uid, MPPS_STATUS_IN_PROGRESS))
+        server._handle_n_set(_make_n_set_event(uid, MPPS_STATUS_COMPLETED))
+        # Try to set again from completed
+        status, ds = server._handle_n_set(_make_n_set_event(uid, MPPS_STATUS_DISCONTINUED))
+        assert status == 0x0110
+
+
+class TestIssue5CharsetMPPS:
+    """Issue #5 — MPPS response datasets must carry SpecificCharacterSet."""
+
+    def test_n_create_response_has_charset(self) -> None:
+        server = MPPSServer()
+        event = _make_n_create_event("1.2.3.charset.1", MPPS_STATUS_IN_PROGRESS)
+        _status, response = server._handle_n_create(event)
+        assert response is not None
+        assert response.SpecificCharacterSet == CHARSET_UTF8
+
+    def test_n_set_response_has_charset(self) -> None:
+        server = MPPSServer()
+        uid = "1.2.3.charset.2"
+        server._handle_n_create(_make_n_create_event(uid, MPPS_STATUS_IN_PROGRESS))
+        _status, response = server._handle_n_set(_make_n_set_event(uid, MPPS_STATUS_COMPLETED))
+        assert response is not None
+        assert response.SpecificCharacterSet == CHARSET_UTF8
+
+
+class TestIssue9TransferSyntaxesMPPS:
+    """Issue #9 — 8 transfer syntaxes for MPPS SCP."""
+
+    def test_transfer_syntaxes_count(self) -> None:
+        assert len(TRANSFER_SYNTAXES) == 8
+
+    def test_explicit_vr_le(self) -> None:
+        assert "1.2.840.10008.1.2.1" in TRANSFER_SYNTAXES
+
+    def test_implicit_vr_le(self) -> None:
+        assert "1.2.840.10008.1.2" in TRANSFER_SYNTAXES
+
+
+# ---------------------------------------------------------------------------
+# GAP-9: _invoke_callback error handling — HIGH-4 regression
+# ---------------------------------------------------------------------------
+
+
+class TestInvokeCallbackErrorHandling:
+    """_invoke_callback failure must propagate DIMSE status 0xC001 to the SCU.
+
+    Before HIGH-4 fix, a callback exception was swallowed and the DIMSE status
+    returned as success (0x0000).  Now the handler returns 0xC001 on failure.
+    """
+
+    def test_callback_failure_on_n_create_returns_processing_error(self) -> None:
+        """_invoke_callback raising → _handle_n_create returns 0xC001."""
+        import asyncio
+        import threading
+
+        async def _failing_callback(mpps_uid: str, mpps_data: dict) -> None:
+            raise RuntimeError("DB write failed")
+
+        # run_coroutine_threadsafe requires the loop to be running in a thread
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            server = MPPSServer(status_callback=_failing_callback, loop=loop)
+            uid = "1.2.3.callback.error.1"
+            event = _make_n_create_event(uid, MPPS_STATUS_IN_PROGRESS)
+            status, ds = server._handle_n_create(event)
+
+            assert status == 0xC001
+            assert ds is None
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2.0)
+            loop.close()
+
+    def test_callback_success_on_n_create_returns_zero(self) -> None:
+        """_invoke_callback succeeding → _handle_n_create returns 0x0000."""
+        import asyncio
+        import threading
+
+        async def _ok_callback(mpps_uid: str, mpps_data: dict) -> None:
+            pass  # success
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            server = MPPSServer(status_callback=_ok_callback, loop=loop)
+            uid = "1.2.3.callback.ok.1"
+            event = _make_n_create_event(uid, MPPS_STATUS_IN_PROGRESS)
+            status, ds = server._handle_n_create(event)
+
+            assert status == 0x0000
+            assert ds is not None
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2.0)
+            loop.close()
+
+    def test_no_callback_configured_returns_success(self) -> None:
+        """When no callback is configured, _invoke_callback returns True → success."""
+        server = MPPSServer(status_callback=None, loop=None)
+        uid = "1.2.3.no.callback.1"
+        event = _make_n_create_event(uid, MPPS_STATUS_IN_PROGRESS)
+        status, ds = server._handle_n_create(event)
+
+        assert status == 0x0000
+        assert ds is not None
+
+    def test_callback_failure_on_n_set_returns_processing_error(self) -> None:
+        """GAP-I4: callback raising during N-SET → _handle_n_set returns 0xC001.
+
+        Before the fix, N-SET callback exceptions were swallowed. Now 0xC001
+        must be returned so the modality knows the MPPS update was not persisted.
+        """
+        import asyncio
+        import threading
+
+        async def _failing_callback(mpps_uid: str, mpps_data: dict) -> None:
+            raise RuntimeError("DB write failed on N-SET")
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            # Create instance with no-callback server to seed the state machine
+            seed_server = MPPSServer(status_callback=None, loop=None)
+            uid = "1.2.3.nset.callback.fail.1"
+            create_event = _make_n_create_event(uid, MPPS_STATUS_IN_PROGRESS)
+            c_status, _ = seed_server._handle_n_create(create_event)
+            assert c_status == 0x0000
+
+            # Build the failing server and inject the seeded instance
+            failing_server = MPPSServer(status_callback=_failing_callback, loop=loop)
+            failing_server._instances[uid] = seed_server._instances[uid]
+
+            # N-SET with a callback that will fail
+            set_event = _make_n_set_event(uid, MPPS_STATUS_COMPLETED)
+            status, ds = failing_server._handle_n_set(set_event)
+
+            assert status == 0xC001
+            assert ds is None
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2.0)
+            loop.close()
+
+    def test_callback_success_on_n_set_returns_zero(self) -> None:
+        """GAP-I4: callback succeeding during N-SET → _handle_n_set returns 0x0000."""
+        import asyncio
+        import threading
+
+        async def _ok_callback(mpps_uid: str, mpps_data: dict) -> None:
+            pass  # success
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            server = MPPSServer(status_callback=_ok_callback, loop=loop)
+            uid = "1.2.3.nset.callback.ok.1"
+            create_event = _make_n_create_event(uid, MPPS_STATUS_IN_PROGRESS)
+            c_status, _ = server._handle_n_create(create_event)
+            assert c_status == 0x0000
+
+            set_event = _make_n_set_event(uid, MPPS_STATUS_COMPLETED)
+            status, ds = server._handle_n_set(set_event)
+
+            assert status == 0x0000
+            assert ds is not None
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2.0)
+            loop.close()

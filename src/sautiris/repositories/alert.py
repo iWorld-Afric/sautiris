@@ -5,10 +5,11 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from typing import Literal
 
 from sqlalchemy import func, select
 
-from sautiris.models.alert import CriticalAlert
+from sautiris.models.alert import AlertUrgency, CriticalAlert
 from sautiris.repositories.base import TenantAwareRepository
 
 
@@ -18,8 +19,8 @@ class AlertRepository(TenantAwareRepository[CriticalAlert]):
     async def list_filtered(
         self,
         *,
-        status: str | None = None,
-        urgency: str | None = None,
+        status: Literal["PENDING", "ACKNOWLEDGED", "ESCALATED"] | None = None,
+        urgency: AlertUrgency | None = None,
         offset: int = 0,
         limit: int = 100,
     ) -> Sequence[CriticalAlert]:

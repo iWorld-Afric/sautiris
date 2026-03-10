@@ -5,8 +5,10 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 from datetime import date
+from typing import Literal
 
 from sqlalchemy import func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from sautiris.models.billing import BillingCode, OrderBilling
 from sautiris.repositories.base import TenantAwareRepository
@@ -15,10 +17,8 @@ from sautiris.repositories.base import TenantAwareRepository
 class BillingCodeRepository:
     """Reference table repository — not tenant-scoped."""
 
-    def __init__(self, session: object) -> None:
-        from sqlalchemy.ext.asyncio import AsyncSession
-
-        self.session: AsyncSession = session  # type: ignore[assignment]
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
 
     async def search_codes(
         self,
@@ -84,7 +84,7 @@ class OrderBillingRepository(TenantAwareRepository[OrderBilling]):
         *,
         date_from: date | None = None,
         date_to: date | None = None,
-        group_by: str = "code_system",
+        group_by: Literal["month", "modality", "code_system"] = "code_system",
     ) -> list[dict[str, object]]:
         """Revenue grouped by code_system, modality, or month."""
         from typing import Any

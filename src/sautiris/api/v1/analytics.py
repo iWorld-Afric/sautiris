@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sautiris.api.deps import get_db, require_permission
 from sautiris.core.auth.base import AuthUser
+from sautiris.models.order import Urgency
 from sautiris.services.analytics_service import AnalyticsService
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
@@ -17,7 +18,7 @@ router = APIRouter(prefix="/analytics", tags=["analytics"])
 @router.get("/tat")
 async def get_tat_metrics(
     modality: str | None = None,
-    urgency: str | None = None,
+    urgency: Urgency | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
     db: AsyncSession = Depends(get_db),

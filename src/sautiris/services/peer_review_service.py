@@ -13,6 +13,7 @@ from sautiris.core.tenancy import get_current_tenant_id
 from sautiris.models.peer_review import (
     AgreementScore,
     Discrepancy,
+    DiscrepancyCategory,
     DiscrepancySeverity,
     PeerReview,
     ReviewType,
@@ -38,7 +39,7 @@ class PeerReviewService:
         reviewer_id: uuid.UUID,
         reviewer_name: str | None = None,
         original_reporter_id: uuid.UUID | None = None,
-        review_type: str = ReviewType.RANDOM,
+        review_type: ReviewType = ReviewType.RANDOM,
     ) -> PeerReview:
         """Create a new peer review assignment."""
         review = PeerReview(
@@ -51,7 +52,7 @@ class PeerReviewService:
             review_type=review_type,
         )
         created = await self.review_repo.create(review)
-        await self.session.commit()
+        await self.session.flush()
 
         logger.info(
             "peer_review_created",
@@ -65,8 +66,8 @@ class PeerReviewService:
     async def list_reviews(
         self,
         *,
-        review_type: str | None = None,
-        agreement_score: str | None = None,
+        review_type: ReviewType | None = None,
+        agreement_score: AgreementScore | None = None,
         reviewer_id: uuid.UUID | None = None,
         offset: int = 0,
         limit: int = 100,
@@ -89,7 +90,7 @@ class PeerReviewService:
         self,
         review_id: uuid.UUID,
         *,
-        agreement_score: str,
+        agreement_score: AgreementScore,
         comments: str | None = None,
     ) -> PeerReview:
         """Submit agreement score and comments for an existing review."""
@@ -101,7 +102,7 @@ class PeerReviewService:
         review.comments = comments
         review.reviewed_at = datetime.now(UTC)
         updated = await self.review_repo.update(review)
-        await self.session.commit()
+        await self.session.flush()
 
         logger.info(
             "peer_review_submitted",
@@ -114,8 +115,8 @@ class PeerReviewService:
         self,
         review_id: uuid.UUID,
         *,
-        severity: str,
-        category: str,
+        severity: DiscrepancySeverity,
+        category: DiscrepancyCategory,
         description: str | None = None,
         clinical_impact: str | None = None,
     ) -> Discrepancy:
@@ -143,7 +144,7 @@ class PeerReviewService:
         elif severity == DiscrepancySeverity.MINOR and review.agreement_score is None:
             review.agreement_score = AgreementScore.MINOR_DISCREPANCY
 
-        await self.session.commit()
+        await self.session.flush()
 
         logger.info(
             "discrepancy_reported",
@@ -213,12 +214,12 @@ class PeerReviewService:
         now = datetime.now(UTC)
 
         # Recent period: last 3 months
-        recent_end = now.isoformat()
-        recent_start = (now - timedelta(days=90)).isoformat()
+        recent_end = now
+        recent_start = now - timedelta(days=90)
 
         # Prior period: 3-6 months ago
         prior_end = recent_start
-        prior_start = (now - timedelta(days=180)).isoformat()
+        prior_start = now - timedelta(days=180)
 
         recent_rate = await self.review_repo.agreement_rate_in_period(
             radiologist_id, start=recent_start, end=recent_end

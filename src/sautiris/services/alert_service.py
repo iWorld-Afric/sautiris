@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,7 +22,7 @@ class NotificationDispatcher(Protocol):
     async def dispatch(
         self,
         *,
-        method: str,
+        method: NotificationMethod,
         recipient_id: uuid.UUID | None,
         recipient_name: str | None,
         message: str,
@@ -36,7 +36,7 @@ class LoggingNotificationDispatcher:
     async def dispatch(
         self,
         *,
-        method: str,
+        method: NotificationMethod,
         recipient_id: uuid.UUID | None,
         recipient_name: str | None,
         message: str,
@@ -75,12 +75,12 @@ class AlertService:
         *,
         order_id: uuid.UUID,
         report_id: uuid.UUID | None = None,
-        alert_type: str = AlertType.CRITICAL_FINDING,
+        alert_type: AlertType = AlertType.CRITICAL_FINDING,
         finding_description: str | None = None,
-        urgency: str = AlertUrgency.URGENT,
+        urgency: AlertUrgency = AlertUrgency.URGENT,
         notified_physician_id: uuid.UUID | None = None,
         notified_physician_name: str | None = None,
-        notification_method: str = NotificationMethod.IN_APP,
+        notification_method: NotificationMethod = NotificationMethod.IN_APP,
     ) -> CriticalAlert:
         """Create a critical alert and dispatch notification."""
         now = datetime.now(UTC)
@@ -103,13 +103,25 @@ class AlertService:
         message = (
             f"CRITICAL ALERT: {alert_type} — {finding_description or 'Critical finding detected'}"
         )
-        await self.dispatcher.dispatch(
-            method=notification_method,
-            recipient_id=notified_physician_id,
-            recipient_name=notified_physician_name,
-            message=message,
-            alert_id=created.id,
-        )
+        try:
+            await self.dispatcher.dispatch(
+                method=notification_method,
+                recipient_id=notified_physician_id,
+                recipient_name=notified_physician_name,
+                message=message,
+                alert_id=created.id,
+            )
+        except Exception:
+            logger.critical(
+                "alert.notification_dispatch_failed",
+                alert_id=str(created.id),
+                method=notification_method,
+                exc_info=True,
+                msg=(
+                    "Critical alert notification could not be dispatched"
+                    " — manual follow-up required"
+                ),
+            )
 
         logger.warning(
             "critical_alert_created",
@@ -123,8 +135,8 @@ class AlertService:
     async def list_alerts(
         self,
         *,
-        status: str | None = None,
-        urgency: str | None = None,
+        status: Literal["PENDING", "ACKNOWLEDGED", "ESCALATED"] | None = None,
+        urgency: AlertUrgency | None = None,
         offset: int = 0,
         limit: int = 100,
     ) -> list[CriticalAlert]:
@@ -174,13 +186,25 @@ class AlertService:
         # Re-dispatch notification for escalation
         desc = alert.finding_description or "Critical finding requires attention"
         message = f"ESCALATED ALERT: {alert.alert_type} — {desc}"
-        await self.dispatcher.dispatch(
-            method=alert.notification_method or NotificationMethod.IN_APP,
-            recipient_id=alert.notified_physician_id,
-            recipient_name=alert.notified_physician_name,
-            message=message,
-            alert_id=alert_id,
-        )
+        try:
+            await self.dispatcher.dispatch(
+                method=alert.notification_method or NotificationMethod.IN_APP,
+                recipient_id=alert.notified_physician_id,
+                recipient_name=alert.notified_physician_name,
+                message=message,
+                alert_id=alert_id,
+            )
+        except Exception:
+            logger.critical(
+                "alert.notification_dispatch_failed",
+                alert_id=str(alert_id),
+                method=alert.notification_method or NotificationMethod.IN_APP,
+                exc_info=True,
+                msg=(
+                    "Critical alert notification could not be dispatched"
+                    " — manual follow-up required"
+                ),
+            )
 
         logger.warning(
             "alert_escalated",
@@ -210,23 +234,51 @@ class AlertService:
 
         escalated: list[CriticalAlert] = []
         for alert in stale_alerts:
-            updated = await self.repo.escalate(alert)
+            try:
+                updated = await self.repo.escalate(alert)
+            except Exception:
+                logger.error(
+                    "alert.escalation_failed",
+                    alert_id=str(alert.id),
+                    exc_info=True,
+                )
+                continue
             escalated.append(updated)
 
             message = (
                 f"AUTO-ESCALATED: {alert.alert_type}"
                 f" — unacknowledged for {self.escalation_timeout} minutes"
             )
-            await self.dispatcher.dispatch(
-                method=alert.notification_method or NotificationMethod.IN_APP,
-                recipient_id=alert.notified_physician_id,
-                recipient_name=alert.notified_physician_name,
-                message=message,
-                alert_id=alert.id,
-            )
+            try:
+                await self.dispatcher.dispatch(
+                    method=alert.notification_method or NotificationMethod.IN_APP,
+                    recipient_id=alert.notified_physician_id,
+                    recipient_name=alert.notified_physician_name,
+                    message=message,
+                    alert_id=alert.id,
+                )
+            except Exception:
+                logger.critical(
+                    "alert.notification_dispatch_failed",
+                    alert_id=str(alert.id),
+                    method=alert.notification_method or NotificationMethod.IN_APP,
+                    exc_info=True,
+                    msg=(
+                    "Critical alert notification could not be dispatched"
+                    " — manual follow-up required"
+                ),
+                )
 
         if escalated:
-            await self.session.commit()
+            try:
+                await self.session.commit()
+            except Exception:
+                logger.critical(
+                    "alert.escalation_commit_failed",
+                    escalated_count=len(escalated),
+                    exc_info=True,
+                    msg="Failed to persist auto-escalation records — manual follow-up required",
+                )
             logger.warning(
                 "auto_escalation_completed",
                 escalated_count=len(escalated),

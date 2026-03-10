@@ -95,6 +95,7 @@ def _safe_get(segment: object, field_name: str, default: str = "") -> str:
             return default
         return str(val.value) if hasattr(val, "value") else str(val)
     except Exception:
+        logger.warning("hl7v2.field_parse_error", field=field_name, exc_info=True)
         return default
 
 
@@ -110,6 +111,7 @@ def _safe_component(field_obj: object, index: int, default: str = "") -> str:
             )
         return default
     except Exception:
+        logger.warning("hl7v2.field_parse_error", index=index, exc_info=True)
         return default
 
 
@@ -119,6 +121,7 @@ def _parse_patient(msg: Message) -> HL7v2Patient:
     try:
         pid = msg.pid
     except Exception:
+        logger.warning("hl7v2.patient_parse_error", exc_info=True)
         return patient
 
     patient.patient_id = _safe_get(pid, "pid_3")

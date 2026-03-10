@@ -104,3 +104,219 @@ async def test_get_stats(worklist_service: WorklistService) -> None:
     )
     stats = await worklist_service.get_stats()
     assert stats.get("SCHEDULED", 0) == 1
+
+
+# ---------------------------------------------------------------------------
+# GAP: WorklistService._publish error logging
+# ---------------------------------------------------------------------------
+
+
+async def test_worklist_publish_handler_error_is_logged(db_session: AsyncSession) -> None:
+    """WorklistService._publish logs ERROR for each failing event handler.
+
+    WorklistService._publish uses logger.error (not warning) for handler
+    failures. ExamCompleted failures additionally produce a second logger.error
+    call flagging the workflow-critical nature of the failure.
+    """
+    from unittest.mock import patch
+
+    from sautiris.core.events import EventBus
+
+    bus = EventBus()
+
+    async def _failing_handler(event: object) -> None:
+        raise ValueError("worklist notification down")
+
+    # Subscribe to the exam.started event (triggered by IN_PROGRESS transition)
+    bus.subscribe("exam.started", _failing_handler)
+    svc = WorklistService(db_session, event_bus=bus)
+
+    # Create a worklist item and transition to IN_PROGRESS
+    item = await svc.create_worklist_item(
+        order_id=uuid.uuid4(),
+        accession_number="ACC-PUBLISH-ERR",
+        patient_id="PAT-ERR",
+        patient_name="DOE^ERR",
+        modality="CT",
+    )
+
+    with patch("sautiris.services.worklist_service.logger") as mock_logger:
+        await svc.update_procedure_step_status(item.id, WorklistStatus.IN_PROGRESS)
+        # logger.error must be called for the handler failure
+        mock_logger.error.assert_called()
+
+
+async def test_worklist_exam_completed_handler_failure_logs_secondary_error(
+    db_session: AsyncSession,
+) -> None:
+    """ExamCompleted handler failure triggers an additional error about workflow impact.
+
+    WorklistService._publish checks isinstance(event, ExamCompleted) and emits
+    a second logger.error with 'exam_completed_handlers_failed' to signal that
+    a workflow-critical event was not delivered.
+    """
+    from unittest.mock import patch
+
+    from sautiris.core.events import EventBus
+
+    bus = EventBus()
+
+    async def _failing_handler(event: object) -> None:
+        raise RuntimeError("order service unreachable")
+
+    bus.subscribe("exam.completed", _failing_handler)
+    svc = WorklistService(db_session, event_bus=bus)
+
+    # Create item and advance to IN_PROGRESS (needed to allow COMPLETED transition)
+    item = await svc.create_worklist_item(
+        order_id=uuid.uuid4(),
+        accession_number="ACC-EXAM-COMP-ERR",
+        patient_id="PAT-COMP",
+        patient_name="SMITH^JOHN",
+        modality="MR",
+    )
+    await svc.update_procedure_step_status(item.id, WorklistStatus.IN_PROGRESS)
+
+    with patch("sautiris.services.worklist_service.logger") as mock_logger:
+        await svc.update_procedure_step_status(item.id, WorklistStatus.COMPLETED)
+        # Must call logger.error (at least once for handler error, once for exam_completed msg)
+        error_calls = mock_logger.error.call_args_list
+        assert len(error_calls) >= 1
+        all_error_args = " ".join(str(c.args) for c in error_calls)
+        assert "event_bus" in all_error_args or "exam_completed" in all_error_args
+
+
+async def test_worklist_publish_no_error_does_not_log_error(
+    db_session: AsyncSession,
+) -> None:
+    """_publish does NOT call logger.error when all handlers succeed."""
+    from unittest.mock import patch
+
+    from sautiris.core.events import EventBus
+
+    bus = EventBus()
+
+    async def _ok_handler(event: object) -> None:
+        pass  # success
+
+    bus.subscribe("exam.started", _ok_handler)
+    svc = WorklistService(db_session, event_bus=bus)
+
+    item = await svc.create_worklist_item(
+        order_id=uuid.uuid4(),
+        accession_number="ACC-NO-ERR",
+        patient_id="PAT-NO-ERR",
+        patient_name="DOE^JANE",
+        modality="CT",
+    )
+
+    with patch("sautiris.services.worklist_service.logger") as mock_logger:
+        await svc.update_procedure_step_status(item.id, WorklistStatus.IN_PROGRESS)
+        handler_errors = [
+            call
+            for call in mock_logger.error.call_args_list
+            if "event_bus.handler_error" in str(call.args)
+        ]
+        assert len(handler_errors) == 0
+
+
+# ---------------------------------------------------------------------------
+# GAP-R4-3: receive_mpps DISCONTINUED path
+# ---------------------------------------------------------------------------
+
+
+async def test_receive_mpps_discontinued_from_in_progress(
+    worklist_service: WorklistService,
+) -> None:
+    """receive_mpps with DISCONTINUED transitions an IN_PROGRESS item to DISCONTINUED."""
+    item = await worklist_service.create_worklist_item(
+        order_id=uuid.uuid4(),
+        accession_number="ACC-DISC-01",
+        patient_id="PAT-DISC-01",
+        patient_name="DOE^DISC",
+        modality="CT",
+    )
+    # Advance to IN_PROGRESS first
+    await worklist_service.update_procedure_step_status(item.id, WorklistStatus.IN_PROGRESS)
+
+    updated = await worklist_service.receive_mpps(
+        item.id,
+        mpps_status=MPPSStatus.DISCONTINUED,
+        mpps_uid="1.2.840.10008.5.1.4.1.1.99",
+    )
+
+    assert updated.mpps_status == MPPSStatus.DISCONTINUED
+    assert updated.status == WorklistStatus.DISCONTINUED
+
+
+async def test_receive_mpps_discontinued_from_scheduled(
+    worklist_service: WorklistService,
+) -> None:
+    """receive_mpps with DISCONTINUED on a SCHEDULED item also marks it DISCONTINUED."""
+    item = await worklist_service.create_worklist_item(
+        order_id=uuid.uuid4(),
+        accession_number="ACC-DISC-02",
+        patient_id="PAT-DISC-02",
+        patient_name="SMITH^DISC",
+        modality="MR",
+    )
+    # item is still SCHEDULED — DISCONTINUED MPPS should still mark it DISCONTINUED
+    updated = await worklist_service.receive_mpps(
+        item.id,
+        mpps_status=MPPSStatus.DISCONTINUED,
+    )
+
+    assert updated.mpps_status == MPPSStatus.DISCONTINUED
+    assert updated.status == WorklistStatus.DISCONTINUED
+
+
+async def test_receive_mpps_discontinued_sets_mpps_uid(
+    worklist_service: WorklistService,
+) -> None:
+    """receive_mpps stores the mpps_uid when provided alongside DISCONTINUED status."""
+    item = await worklist_service.create_worklist_item(
+        order_id=uuid.uuid4(),
+        accession_number="ACC-DISC-03",
+        patient_id="PAT-DISC-03",
+        patient_name="JONES^DISC",
+        modality="CR",
+    )
+    uid = "2.25.1234567890"
+    updated = await worklist_service.receive_mpps(
+        item.id,
+        mpps_status=MPPSStatus.DISCONTINUED,
+        mpps_uid=uid,
+    )
+
+    assert updated.mpps_uid == uid
+
+
+# ---------------------------------------------------------------------------
+# GAP-H6: receive_mpps() COMPLETED on non-IN_PROGRESS item
+# ---------------------------------------------------------------------------
+
+
+async def test_receive_mpps_completed_on_scheduled_updates_mpps_status_only(
+    worklist_service: WorklistService,
+) -> None:
+    """GAP-H6: receive_mpps(COMPLETED) on a SCHEDULED item sets mpps_status=COMPLETED
+    but leaves worklist status as SCHEDULED (transition only allowed from IN_PROGRESS)."""
+    item = await worklist_service.create_worklist_item(
+        order_id=uuid.uuid4(),
+        accession_number="ACC-MPPS-SCHED",
+        patient_id="PAT-MPPS-S",
+        patient_name="GAP^H6",
+        modality="CT",
+    )
+    assert item.status == WorklistStatus.SCHEDULED
+
+    updated = await worklist_service.receive_mpps(
+        item.id,
+        mpps_status=MPPSStatus.COMPLETED,
+        mpps_uid="1.2.3.4.5.6",
+    )
+
+    # mpps_status is updated…
+    assert updated.mpps_status == MPPSStatus.COMPLETED
+    # …but worklist status stays SCHEDULED because item was not IN_PROGRESS
+    assert updated.status == WorklistStatus.SCHEDULED

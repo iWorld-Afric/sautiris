@@ -6,11 +6,11 @@ import uuid
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from sautiris.models.base import Base, TenantAwareBase
+from sautiris.models.base import TenantAwareBase
 
 
 class ReportStatus(StrEnum):
@@ -27,6 +27,11 @@ class RadiologyReport(TenantAwareBase):
         Index("ix_radiology_reports_order", "order_id"),
         Index("ix_radiology_reports_accession", "accession_number"),
         Index("ix_radiology_reports_status", "report_status"),
+        # MEDIUM-16: addendum must reference a parent report
+        CheckConstraint(
+            "is_addendum = FALSE OR parent_report_id IS NOT NULL",
+            name="ck_radiology_reports_addendum_has_parent",
+        ),
     )
 
     order_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("radiology_orders.id"), index=True)
@@ -34,7 +39,8 @@ class RadiologyReport(TenantAwareBase):
         ForeignKey("report_templates.id"), default=None
     )
     accession_number: Mapped[str] = mapped_column(String(64))
-    report_status: Mapped[str] = mapped_column(String(32), default=ReportStatus.DRAFT)
+    # MEDIUM-15: typed with ReportStatus enum instead of str
+    report_status: Mapped[ReportStatus] = mapped_column(String(32), default=ReportStatus.DRAFT)
     findings: Mapped[str | None] = mapped_column(Text, default=None)
     impression: Mapped[str | None] = mapped_column(Text, default=None)
     recommendation: Mapped[str | None] = mapped_column(Text, default=None)
@@ -74,13 +80,12 @@ class ReportTemplate(TenantAwareBase):
     created_by: Mapped[uuid.UUID | None] = mapped_column(default=None)
 
 
-class ReportVersion(Base):
+class ReportVersion(TenantAwareBase):
     __tablename__ = "report_versions"
 
-    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     report_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("radiology_reports.id"), index=True)
     version_number: Mapped[int] = mapped_column(Integer)
-    status_at_version: Mapped[str] = mapped_column(String(32))
+    status_at_version: Mapped[ReportStatus] = mapped_column(String(32))
     findings: Mapped[str | None] = mapped_column(Text, default=None)
     impression: Mapped[str | None] = mapped_column(Text, default=None)
     body: Mapped[dict[str, object] | None] = mapped_column(JSONB, default=None)

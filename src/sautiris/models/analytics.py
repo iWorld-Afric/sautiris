@@ -9,6 +9,7 @@ from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sautiris.models.base import TenantAwareBase
+from sautiris.models.order import Urgency
 
 
 class TATMetric(TenantAwareBase):
@@ -22,6 +23,6 @@ class TATMetric(TenantAwareBase):
     final_to_distributed_mins: Mapped[int | None] = mapped_column(Integer, default=None)
     total_tat_mins: Mapped[int | None] = mapped_column(Integer, default=None)
     modality: Mapped[str | None] = mapped_column(String(16), default=None)
-    urgency: Mapped[str | None] = mapped_column(String(16), default=None)
+    urgency: Mapped[Urgency | None] = mapped_column(String(16), default=None)
     is_critical: Mapped[bool] = mapped_column(Boolean, default=False)
     measured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)

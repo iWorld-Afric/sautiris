@@ -8,10 +8,12 @@ Also includes webhook handling for async AI provider results.
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
 import structlog
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from sautiris.integrations.ai.base import AIFinding
 
@@ -144,7 +146,7 @@ class AIWebhookHandler:
     Validates webhook signatures and persists AI findings from async providers.
     """
 
-    def __init__(self, session: Any) -> None:
+    def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
     async def validate_webhook(
@@ -187,8 +189,6 @@ class AIWebhookHandler:
         payload: dict[str, Any],
     ) -> list[dict[str, Any]]:
         """Process AI provider webhook payload and persist findings."""
-        import uuid
-
         from sqlalchemy import select
 
         from sautiris.core.tenancy import get_current_tenant_id
@@ -200,7 +200,9 @@ class AIWebhookHandler:
 
         if not order_id_str:
             logger.error("ai_webhook_missing_order_id", provider_name=provider_name)
-            return []
+            raise ValueError(
+                "Webhook payload missing both order_id and accession_number"
+            )
 
         # Resolve provider config ID
         stmt = select(AIProviderConfig.id).where(
@@ -241,12 +243,10 @@ class AIWebhookHandler:
 
 
 async def enrich_report_with_ai_findings(
-    session: Any,
-    order_id: Any,
+    session: AsyncSession,
+    order_id: uuid.UUID,
 ) -> list[dict[str, Any]]:
     """Get AI findings for an order, formatted for report metadata overlay."""
-    import uuid
-
     from sqlalchemy import select
 
     from sautiris.core.tenancy import get_current_tenant_id
@@ -254,7 +254,7 @@ async def enrich_report_with_ai_findings(
 
     stmt = select(AIFindingModel).where(
         AIFindingModel.tenant_id == get_current_tenant_id(),
-        AIFindingModel.order_id == uuid.UUID(str(order_id)),
+        AIFindingModel.order_id == order_id,
     )
     result = await session.execute(stmt)
     findings = list(result.scalars().all())

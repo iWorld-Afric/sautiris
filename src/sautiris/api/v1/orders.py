@@ -9,8 +9,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sautiris.api.deps import get_db, require_permission
+from sautiris.api.deps import get_db, get_event_bus, require_permission
 from sautiris.core.auth.base import AuthUser
+from sautiris.core.events import EventBus
+from sautiris.models.order import OrderStatus, Urgency
 from sautiris.services.order_service import (
     InvalidTransitionError,
     OrderNotFoundError,
@@ -26,7 +28,7 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 class OrderCreate(BaseModel):
     patient_id: uuid.UUID
     modality: str
-    urgency: str = "ROUTINE"
+    urgency: Urgency = Urgency.ROUTINE
     body_part: str | None = None
     laterality: str | None = None
     procedure_code: str | None = None
@@ -50,7 +52,7 @@ class OrderUpdate(BaseModel):
     clinical_indication: str | None = None
     patient_history: str | None = None
     special_instructions: str | None = None
-    urgency: str | None = None
+    urgency: Urgency | None = None
 
 
 class OrderSchedule(BaseModel):
@@ -69,8 +71,8 @@ class OrderResponse(BaseModel):
     patient_id: uuid.UUID
     accession_number: str
     modality: str
-    urgency: str
-    status: str
+    urgency: Urgency
+    status: OrderStatus
     body_part: str | None = None
     laterality: str | None = None
     procedure_code: str | None = None
@@ -98,26 +100,28 @@ class PaginatedOrders(BaseModel):
 async def create_order(
     body: OrderCreate,
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("order:create")),
 ) -> object:
-    svc = OrderService(db)
+    svc = OrderService(db, event_bus=event_bus)
     return await svc.create_order(**body.model_dump(exclude_none=True))
 
 
 @router.get("", response_model=PaginatedOrders)
 async def list_orders(
     modality: str | None = None,
-    order_status: str | None = Query(None, alias="status"),
-    urgency: str | None = None,
+    order_status: OrderStatus | None = Query(None, alias="status"),
+    urgency: Urgency | None = None,
     patient_id: uuid.UUID | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("order:read")),
 ) -> object:
-    svc = OrderService(db)
+    svc = OrderService(db, event_bus=event_bus)
     items, total = await svc.list_orders(
         modality=modality,
         status=order_status,
@@ -134,9 +138,10 @@ async def list_orders(
 @router.get("/stats")
 async def get_order_stats(
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("order:read")),
 ) -> dict[str, int]:
-    svc = OrderService(db)
+    svc = OrderService(db, event_bus=event_bus)
     return await svc.get_order_stats()
 
 
@@ -144,10 +149,17 @@ async def get_order_stats(
 async def get_next_accession(
     modality: str = Query(...),
     db: AsyncSession = Depends(get_db),
-    user: AuthUser = Depends(require_permission("order:create")),
+    event_bus: EventBus = Depends(get_event_bus),
+    user: AuthUser = Depends(require_permission("order:read")),
 ) -> dict[str, str]:
-    svc = OrderService(db)
-    accession = await svc.get_next_accession(modality)
+    """Preview the next accession number without reserving it.
+
+    This is a read-only peek — the counter is NOT incremented.  The returned
+    number is an estimate; a concurrent order creation may claim it first.
+    Use ``POST /orders`` to actually generate and consume a number.
+    """
+    svc = OrderService(db, event_bus=event_bus)
+    accession = await svc.peek_next_accession(modality)
     return {"accession_number": accession}
 
 
@@ -155,9 +167,10 @@ async def get_next_accession(
 async def get_order(
     order_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("order:read")),
 ) -> object:
-    svc = OrderService(db)
+    svc = OrderService(db, event_bus=event_bus)
     try:
         return await svc.get_order(order_id)
     except OrderNotFoundError:
@@ -169,9 +182,10 @@ async def update_order(
     order_id: uuid.UUID,
     body: OrderUpdate,
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("order:update")),
 ) -> object:
-    svc = OrderService(db)
+    svc = OrderService(db, event_bus=event_bus)
     try:
         return await svc.update_order(order_id, **body.model_dump(exclude_none=True))
     except OrderNotFoundError:
@@ -185,9 +199,10 @@ async def cancel_order(
     order_id: uuid.UUID,
     body: OrderCancel,
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("order:cancel")),
 ) -> object:
-    svc = OrderService(db)
+    svc = OrderService(db, event_bus=event_bus)
     try:
         return await svc.cancel_order(order_id, reason=body.reason)
     except OrderNotFoundError:
@@ -201,9 +216,10 @@ async def schedule_order(
     order_id: uuid.UUID,
     body: OrderSchedule,
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("order:update")),
 ) -> object:
-    svc = OrderService(db)
+    svc = OrderService(db, event_bus=event_bus)
     try:
         return await svc.schedule_order(order_id, body.scheduled_at)
     except OrderNotFoundError:
@@ -216,9 +232,10 @@ async def schedule_order(
 async def start_exam(
     order_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("order:update")),
 ) -> object:
-    svc = OrderService(db)
+    svc = OrderService(db, event_bus=event_bus)
     try:
         return await svc.start_exam(order_id)
     except OrderNotFoundError:
@@ -231,9 +248,10 @@ async def start_exam(
 async def complete_exam(
     order_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("order:update")),
 ) -> object:
-    svc = OrderService(db)
+    svc = OrderService(db, event_bus=event_bus)
     try:
         return await svc.complete_exam(order_id)
     except OrderNotFoundError:
@@ -246,9 +264,10 @@ async def complete_exam(
 async def get_order_history(
     order_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("order:read")),
 ) -> dict[str, object]:
-    svc = OrderService(db)
+    svc = OrderService(db, event_bus=event_bus)
     try:
         order = await svc.get_order(order_id)
         return {

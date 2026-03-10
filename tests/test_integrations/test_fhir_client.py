@@ -119,3 +119,48 @@ class TestFHIRClient:
     async def test_no_auth_header_without_token(self) -> None:
         client = FHIRClient(base_url="http://fhir.example.com/fhir")
         assert client.auth_token == ""
+
+    # -------------------------------------------------------------------------
+    # GAP-H7: _ensure_client() re-creates client when closed
+    # -------------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_ensure_client_recreates_after_close_and_create_works(self) -> None:
+        """GAP-H7: After close(), create() re-initialises the internal httpx.AsyncClient."""
+        from unittest.mock import AsyncMock, patch
+
+        # Inject a mock that we can close
+        first_mock = self._inject_mock()
+        first_mock.aclose = AsyncMock()
+
+        # Close the client — _client becomes None
+        await self.client.close()
+        assert self.client._client is None
+
+        # Now call create() — _ensure_client() must create a new client
+        second_mock = AsyncMock(spec=httpx.AsyncClient)
+        second_mock.is_closed = False
+        second_mock.post.return_value = _mock_response(
+            json_data={"resourceType": "Patient", "id": "p1"}
+        )
+
+        with patch("sautiris.integrations.fhir.client.httpx.AsyncClient") as mock_client_cls:
+            mock_client_cls.return_value = second_mock
+            result = await self.client.create("Patient", {"resourceType": "Patient"})
+
+        assert result["id"] == "p1"
+
+    @pytest.mark.asyncio
+    async def test_ensure_client_recreates_when_is_closed_flag_true(self) -> None:
+        """GAP-H7b: _ensure_client() creates a fresh client when is_closed=True."""
+        # Inject a mock that pretends to be closed
+        closed_mock = AsyncMock(spec=httpx.AsyncClient)
+        closed_mock.is_closed = True
+        self.client._client = closed_mock
+
+        new_client = await self.client._ensure_client()
+
+        assert new_client is not closed_mock
+        assert not new_client.is_closed
+        # Clean up to avoid ResourceWarning
+        await new_client.aclose()

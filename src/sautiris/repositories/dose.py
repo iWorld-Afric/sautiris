@@ -7,12 +7,41 @@ from collections.abc import Sequence
 
 from sqlalchemy import func, select
 
-from sautiris.models.dose import DoseRecord
+from sautiris.models.dose import DoseRecord, DoseSource
 from sautiris.repositories.base import TenantAwareRepository
 
 
 class DoseRepository(TenantAwareRepository[DoseRecord]):
     model = DoseRecord
+
+    async def list_with_filters(
+        self,
+        *,
+        order_id: uuid.UUID | None = None,
+        source: DoseSource | None = None,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> tuple[Sequence[DoseRecord], int]:
+        base = select(self.model).where(self.model.tenant_id == self._tenant_id)
+        count_base = (
+            select(func.count())
+            .select_from(DoseRecord)
+            .where(self.model.tenant_id == self._tenant_id)
+        )
+
+        if order_id:
+            base = base.where(self.model.order_id == order_id)
+            count_base = count_base.where(self.model.order_id == order_id)
+        if source:
+            base = base.where(self.model.source == source)
+            count_base = count_base.where(self.model.source == source)
+
+        total_result = await self.session.execute(count_base)
+        total = total_result.scalar_one()
+
+        stmt = base.order_by(self.model.recorded_at.desc()).offset(offset).limit(limit)
+        result = await self.session.execute(stmt)
+        return result.scalars().all(), total
 
     async def get_for_order(self, order_id: uuid.UUID) -> Sequence[DoseRecord]:
         stmt = (

@@ -6,9 +6,10 @@ import uuid
 from datetime import date, datetime
 
 import structlog
+from sqlalchemy import inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sautiris.core.events import DomainEvent, event_bus
+from sautiris.core.events import DomainEvent, EventBus
 from sautiris.core.tenancy import get_current_tenant_id
 from sautiris.models.schedule import ScheduleSlot, SlotStatus
 from sautiris.repositories.schedule import ScheduleRepository
@@ -44,9 +45,22 @@ class SlotNotDeletableError(Exception):
 
 
 class ScheduleService:
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, event_bus: EventBus | None = None) -> None:
         self.session = session
         self.repo = ScheduleRepository(session)
+        self._event_bus = event_bus
+
+    async def _publish(self, event: DomainEvent) -> None:
+        """Publish a domain event if an event bus is configured."""
+        if self._event_bus is not None:
+            errors = await self._event_bus.publish(event)
+            if errors:
+                for exc in errors:
+                    logger.warning(
+                        "event_bus.handler_error",
+                        event_type=event.event_type,
+                        error=str(exc),
+                    )
 
     async def create_slot(
         self,
@@ -59,7 +73,7 @@ class ScheduleService:
         duration_minutes: int = 30,
         technologist_id: uuid.UUID | None = None,
         technologist_name: str | None = None,
-        status: str = SlotStatus.AVAILABLE,
+        status: SlotStatus = SlotStatus.AVAILABLE,
         notes: str | None = None,
     ) -> ScheduleSlot:
         conflicts = await self.repo.find_conflicts(
@@ -119,9 +133,15 @@ class ScheduleService:
         if conflicts:
             raise ScheduleConflictError("Update would cause scheduling conflict")
 
+        known_fields = {c.key for c in inspect(ScheduleSlot).mapper.column_attrs}
+        unknown = set(updates.keys()) - known_fields
+        if unknown:
+            logger.warning("update.unknown_fields", fields=unknown, model="ScheduleSlot")
         for key, value in updates.items():
             if key in _SLOT_UPDATABLE_FIELDS:
                 setattr(slot, key, value)
+            elif key in known_fields:
+                logger.warning("update.non_updatable_field", field=key, model="ScheduleSlot")
         updated = await self.repo.update(slot)
         await self._emit("schedule.slot_updated", updated)
         return updated
@@ -139,7 +159,7 @@ class ScheduleService:
         room_id: str | None = None,
         modality: str | None = None,
         technologist_id: uuid.UUID | None = None,
-        status: str | None = None,
+        status: SlotStatus | None = None,
         date_from: date | None = None,
         date_to: date | None = None,
         page: int = 1,
@@ -191,7 +211,7 @@ class ScheduleService:
         return list(conflicts)
 
     async def _emit(self, event_type: str, slot: ScheduleSlot) -> None:
-        await event_bus.publish(
+        await self._publish(
             DomainEvent(
                 event_type=event_type,
                 payload={

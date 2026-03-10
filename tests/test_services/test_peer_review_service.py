@@ -230,3 +230,135 @@ class TestScorecard:
         assert scorecard["total_reviews"] == 1
         assert scorecard["agreement_rate"] == 100.0
         assert scorecard["trending"] in ("improving", "stable", "declining")
+
+
+# ---------------------------------------------------------------------------
+# GAP-C4: submit_review — nonexistent review raises ValueError
+# ---------------------------------------------------------------------------
+
+
+class TestSubmitReviewGaps:
+    async def test_submit_nonexistent_review_raises_value_error(
+        self, review_service: PeerReviewService
+    ) -> None:
+        """GAP-C4: submit_review() raises ValueError for a non-existent review ID."""
+        with pytest.raises(ValueError, match="not found"):
+            await review_service.submit_review(
+                uuid.uuid4(),
+                agreement_score=AgreementScore.AGREE,
+            )
+
+
+# ---------------------------------------------------------------------------
+# GAP-H1: report_discrepancy() — MODERATE severity auto-update logic
+# ---------------------------------------------------------------------------
+
+
+class TestDiscrepancyAutoUpdateLogic:
+    async def test_moderate_after_major_does_not_downgrade(
+        self, review_service: PeerReviewService, order_and_report: tuple[object, object]
+    ) -> None:
+        """GAP-H1a: MODERATE discrepancy must NOT downgrade an existing MAJOR_DISCREPANCY."""
+        order, report = order_and_report
+        review = await review_service.create_review(
+            report_id=report.id,  # type: ignore[attr-defined]
+            order_id=order.id,  # type: ignore[attr-defined]
+            reviewer_id=uuid.uuid4(),
+        )
+        await review_service.report_discrepancy(
+            review.id,
+            severity=DiscrepancySeverity.MAJOR,
+            category=DiscrepancyCategory.INTERPRETIVE,
+        )
+        # Now report MODERATE — must NOT downgrade to MINOR_DISCREPANCY
+        await review_service.report_discrepancy(
+            review.id,
+            severity=DiscrepancySeverity.MODERATE,
+            category=DiscrepancyCategory.COMMUNICATION,
+        )
+        updated = await review_service.get_review(review.id)
+        assert updated is not None
+        assert updated.agreement_score == AgreementScore.MAJOR_DISCREPANCY
+
+    async def test_minor_after_agree_does_not_change_score(
+        self, review_service: PeerReviewService, order_and_report: tuple[object, object]
+    ) -> None:
+        """GAP-H1b: MINOR discrepancy after score is already set to AGREE leaves it unchanged."""
+        order, report = order_and_report
+        review = await review_service.create_review(
+            report_id=report.id,  # type: ignore[attr-defined]
+            order_id=order.id,  # type: ignore[attr-defined]
+            reviewer_id=uuid.uuid4(),
+        )
+        # Set score to AGREE explicitly
+        await review_service.submit_review(review.id, agreement_score=AgreementScore.AGREE)
+        # MINOR discrepancy with non-None agreement_score → must not overwrite
+        await review_service.report_discrepancy(
+            review.id,
+            severity=DiscrepancySeverity.MINOR,
+            category=DiscrepancyCategory.PROCEDURAL,
+        )
+        updated = await review_service.get_review(review.id)
+        assert updated is not None
+        assert updated.agreement_score == AgreementScore.AGREE
+
+
+# ---------------------------------------------------------------------------
+# GAP-M8: _compute_trending() — improving / declining / stable
+# ---------------------------------------------------------------------------
+
+
+class TestComputeTrending:
+    async def test_improving_trend(self, review_service: PeerReviewService) -> None:
+        """GAP-M8a: recent > prior by >5 pp → 'improving'."""
+        from unittest.mock import AsyncMock, patch
+
+        reviewer_id = uuid.uuid4()
+        with patch.object(
+            review_service.review_repo,
+            "agreement_rate_in_period",
+            new=AsyncMock(side_effect=[0.9, 0.8]),  # recent=0.9, prior=0.8 → +0.1
+        ):
+            result = await review_service._compute_trending(reviewer_id)
+        assert result == "improving"
+
+    async def test_declining_trend(self, review_service: PeerReviewService) -> None:
+        """GAP-M8b: recent < prior by >5 pp → 'declining'."""
+        from unittest.mock import AsyncMock, patch
+
+        reviewer_id = uuid.uuid4()
+        with patch.object(
+            review_service.review_repo,
+            "agreement_rate_in_period",
+            new=AsyncMock(side_effect=[0.7, 0.85]),  # recent=0.7, prior=0.85 → -0.15
+        ):
+            result = await review_service._compute_trending(reviewer_id)
+        assert result == "declining"
+
+    async def test_stable_trend(self, review_service: PeerReviewService) -> None:
+        """GAP-M8c: |recent - prior| ≤ 5 pp → 'stable'."""
+        from unittest.mock import AsyncMock, patch
+
+        reviewer_id = uuid.uuid4()
+        with patch.object(
+            review_service.review_repo,
+            "agreement_rate_in_period",
+            new=AsyncMock(side_effect=[0.82, 0.8]),  # diff = +0.02
+        ):
+            result = await review_service._compute_trending(reviewer_id)
+        assert result == "stable"
+
+    async def test_none_recent_rate_returns_stable(
+        self, review_service: PeerReviewService
+    ) -> None:
+        """GAP-M8d: None recent_rate → 'stable' (insufficient data)."""
+        from unittest.mock import AsyncMock, patch
+
+        reviewer_id = uuid.uuid4()
+        with patch.object(
+            review_service.review_repo,
+            "agreement_rate_in_period",
+            new=AsyncMock(side_effect=[None, 0.8]),
+        ):
+            result = await review_service._compute_trending(reviewer_id)
+        assert result == "stable"

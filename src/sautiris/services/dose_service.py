@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sautiris.core.events import DomainEvent, event_bus
+from sautiris.core.events import DomainEvent, DRLExceeded, EventBus
 from sautiris.core.tenancy import get_current_tenant_id
 from sautiris.models.dose import DoseRecord, DoseSource
 from sautiris.repositories.dose import DoseRepository
@@ -50,17 +50,41 @@ class DoseService:
         session: AsyncSession,
         *,
         drl_reference: dict[str, dict[str, dict[str, float]]] | None = None,
+        event_bus: EventBus | None = None,
     ) -> None:
         self.session = session
         self.repo = DoseRepository(session)
         self.drl = drl_reference or DEFAULT_DRL
+        self._event_bus = event_bus
+
+    async def _publish(self, event: DomainEvent) -> None:
+        """Publish a domain event if an event bus is configured."""
+        if self._event_bus is not None:
+            errors = await self._event_bus.publish(event)
+            if errors:
+                for exc in errors:
+                    logger.error(
+                        "event_bus.handler_error",
+                        event_type=event.event_type,
+                        error=str(exc),
+                    )
+                if isinstance(event, DRLExceeded):
+                    logger.critical(
+                        "event_bus.drl_exceeded_handlers_failed",
+                        event_type=event.event_type,
+                        error_count=len(errors),
+                        msg=(
+                            "DRLExceeded handlers failed — patient safety event "
+                            "may not have been delivered"
+                        ),
+                    )
 
     async def record_dose(
         self,
         *,
         order_id: uuid.UUID,
         modality: str,
-        source: str = DoseSource.MANUAL,
+        source: DoseSource = DoseSource.MANUAL,
         recorded_by: uuid.UUID | None = None,
         study_instance_uid: str | None = None,
         ctdi_vol: float | None = None,
@@ -107,7 +131,7 @@ class DoseService:
             recorded_at=datetime.now(UTC),
         )
         created = await self.repo.create(record)
-        await self.session.commit()
+        await self.session.flush()
 
         logger.info(
             "dose_recorded",
@@ -117,20 +141,18 @@ class DoseService:
             exceeds_drl=exceeds_drl,
         )
 
-        # Emit domain event if DRL exceeded
+        # Emit typed DRLExceeded event when dose exceeds reference levels
         if exceeds_drl:
-            await event_bus.publish(
-                DomainEvent(
-                    event_type="DRLExceeded",
-                    payload={
-                        "dose_record_id": str(created.id),
-                        "order_id": str(order_id),
-                        "modality": modality,
-                        "body_part": body_part,
-                        "ctdi_vol": ctdi_vol,
-                        "dlp": dlp,
-                        "dap": dap,
-                    },
+            await self._publish(
+                DRLExceeded(
+                    order_id=str(order_id),
+                    dose_record_id=str(created.id),
+                    modality=modality,
+                    body_part=body_part,
+                    ctdi_vol=ctdi_vol,
+                    dlp=dlp,
+                    dap=dap,
+                    entrance_dose=entrance_dose,
                     tenant_id=get_current_tenant_id(),
                 )
             )
@@ -158,6 +180,24 @@ class DoseService:
     async def get_stats(self) -> list[dict[str, object]]:
         """Get facility-wide dose statistics grouped by modality."""
         return await self.repo.stats_by_modality()
+
+    async def list_records(
+        self,
+        *,
+        order_id: uuid.UUID | None = None,
+        source: DoseSource | None = None,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> tuple[list[DoseRecord], int]:
+        """List dose records with optional filtering."""
+        offset = (page - 1) * page_size
+        items, total = await self.repo.list_with_filters(
+            order_id=order_id,
+            source=source,
+            offset=offset,
+            limit=page_size,
+        )
+        return list(items), total
 
     async def get_drl_compliance(self) -> dict[str, object]:
         """Get DRL compliance report."""

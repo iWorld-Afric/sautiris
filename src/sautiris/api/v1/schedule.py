@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime
+from typing import Self
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sautiris.api.deps import get_db, require_permission
+from sautiris.api.deps import get_db, get_event_bus, require_permission
 from sautiris.core.auth.base import AuthUser
+from sautiris.core.events import EventBus
+from sautiris.models.schedule import SlotStatus
 from sautiris.services.schedule_service import (
     ScheduleConflictError,
     ScheduleService,
@@ -35,6 +38,12 @@ class SlotCreate(BaseModel):
     technologist_name: str | None = None
     notes: str | None = None
 
+    @model_validator(mode="after")
+    def validate_time_range(self) -> Self:
+        if self.scheduled_end <= self.scheduled_start:
+            raise ValueError("scheduled_end must be after scheduled_start")
+        return self
+
 
 class SlotUpdate(BaseModel):
     room_id: str | None = None
@@ -43,7 +52,7 @@ class SlotUpdate(BaseModel):
     duration_minutes: int | None = None
     technologist_id: uuid.UUID | None = None
     technologist_name: str | None = None
-    status: str | None = None
+    status: SlotStatus | None = None
     notes: str | None = None
 
 
@@ -60,7 +69,7 @@ class SlotResponse(BaseModel):
     duration_minutes: int
     technologist_id: uuid.UUID | None = None
     technologist_name: str | None = None
-    status: str
+    status: SlotStatus
     notes: str | None = None
     created_at: datetime
     updated_at: datetime
@@ -80,9 +89,10 @@ class PaginatedSlots(BaseModel):
 async def create_slot(
     body: SlotCreate,
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("schedule:manage")),
 ) -> object:
-    svc = ScheduleService(db)
+    svc = ScheduleService(db, event_bus=event_bus)
     try:
         return await svc.create_slot(**body.model_dump(exclude_none=True))
     except ScheduleConflictError as e:
@@ -94,15 +104,16 @@ async def list_slots(
     room_id: str | None = None,
     modality: str | None = None,
     technologist_id: uuid.UUID | None = None,
-    slot_status: str | None = Query(None, alias="status"),
+    slot_status: SlotStatus | None = Query(None, alias="status"),
     date_from: date | None = None,
     date_to: date | None = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(100, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("schedule:read")),
 ) -> object:
-    svc = ScheduleService(db)
+    svc = ScheduleService(db, event_bus=event_bus)
     items, total = await svc.list_slots(
         room_id=room_id,
         modality=modality,
@@ -120,9 +131,10 @@ async def list_slots(
 async def get_slot(
     slot_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("schedule:read")),
 ) -> object:
-    svc = ScheduleService(db)
+    svc = ScheduleService(db, event_bus=event_bus)
     try:
         return await svc.get_slot(slot_id)
     except SlotNotFoundError:
@@ -134,9 +146,10 @@ async def update_slot(
     slot_id: uuid.UUID,
     body: SlotUpdate,
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("schedule:manage")),
 ) -> object:
-    svc = ScheduleService(db)
+    svc = ScheduleService(db, event_bus=event_bus)
     try:
         return await svc.update_slot(slot_id, **body.model_dump(exclude_none=True))
     except SlotNotFoundError:
@@ -149,9 +162,10 @@ async def update_slot(
 async def delete_slot(
     slot_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("schedule:manage")),
 ) -> None:
-    svc = ScheduleService(db)
+    svc = ScheduleService(db, event_bus=event_bus)
     try:
         await svc.delete_slot(slot_id)
     except SlotNotFoundError:
@@ -166,18 +180,20 @@ async def check_availability(
     date_from: date | None = None,
     date_to: date | None = None,
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("schedule:read")),
 ) -> object:
-    svc = ScheduleService(db)
+    svc = ScheduleService(db, event_bus=event_bus)
     return await svc.check_availability(modality=modality, date_from=date_from, date_to=date_to)
 
 
 @router.get("/rooms")
 async def list_rooms(
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("schedule:read")),
 ) -> list[str]:
-    svc = ScheduleService(db)
+    svc = ScheduleService(db, event_bus=event_bus)
     return await svc.list_rooms()
 
 
@@ -187,7 +203,8 @@ async def detect_conflicts(
     start: datetime = Query(...),
     end: datetime = Query(...),
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("schedule:read")),
 ) -> object:
-    svc = ScheduleService(db)
+    svc = ScheduleService(db, event_bus=event_bus)
     return await svc.detect_conflicts(room_id=room_id, start=start, end=end)

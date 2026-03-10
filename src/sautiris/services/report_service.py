@@ -7,10 +7,10 @@ from collections.abc import Sequence
 from datetime import UTC, date, datetime
 
 import structlog
+from sqlalchemy import inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sautiris.core.events import DomainEvent, event_bus
-from sautiris.core.tenancy import get_current_tenant_id
+from sautiris.core.events import CriticalFinding, DomainEvent, EventBus, ReportFinalized
 from sautiris.models.report import (
     RadiologyReport,
     ReportStatus,
@@ -58,10 +58,33 @@ class InvalidReportTransitionError(Exception):
 
 
 class ReportService:
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, event_bus: EventBus | None = None) -> None:
         self.session = session
         self.report_repo = ReportRepository(session)
         self.template_repo = ReportTemplateRepository(session)
+        self._event_bus = event_bus
+
+    async def _publish(self, event: DomainEvent) -> None:
+        """Publish a domain event if an event bus is configured."""
+        if self._event_bus is not None:
+            errors = await self._event_bus.publish(event)
+            if errors:
+                for exc in errors:
+                    logger.error(
+                        "event_bus.handler_error",
+                        event_type=event.event_type,
+                        error=str(exc),
+                    )
+                if isinstance(event, CriticalFinding):
+                    logger.critical(
+                        "event_bus.critical_finding_handlers_failed",
+                        event_type=event.event_type,
+                        error_count=len(errors),
+                        msg=(
+                            "CriticalFinding handlers failed — patient safety event "
+                            "may not have been delivered"
+                        ),
+                    )
 
     async def create_report(
         self,
@@ -119,7 +142,7 @@ class ReportService:
         self,
         *,
         order_id: uuid.UUID | None = None,
-        status: str | None = None,
+        status: ReportStatus | None = None,
         reported_by: uuid.UUID | None = None,
         is_critical: bool | None = None,
         date_from: date | None = None,
@@ -148,14 +171,20 @@ class ReportService:
         **updates: object,
     ) -> RadiologyReport:
         report = await self.get_report(report_id)
-        current = ReportStatus(report.report_status)
+        current = report.report_status
         if current not in (ReportStatus.DRAFT, ReportStatus.PRELIMINARY):
             raise InvalidReportTransitionError(
                 f"Cannot update report in {current} status; use amend instead"
             )
+        known_fields = {c.key for c in inspect(RadiologyReport).mapper.column_attrs}
+        unknown = set(updates.keys()) - known_fields
+        if unknown:
+            logger.warning("update.unknown_fields", fields=unknown, model="RadiologyReport")
         for key, value in updates.items():
             if key in _REPORT_UPDATABLE_FIELDS:
                 setattr(report, key, value)
+            elif key in known_fields:
+                logger.warning("update.non_updatable_field", field=key, model="RadiologyReport")
         updated = await self.report_repo.update(report)
         await self._create_version(updated, changed_by=changed_by)
         return updated
@@ -168,7 +197,7 @@ class ReportService:
         approved_by_name: str,
     ) -> RadiologyReport:
         report = await self.get_report(report_id)
-        current = ReportStatus(report.report_status)
+        current = report.report_status
         if ReportStatus.FINAL not in VALID_REPORT_TRANSITIONS.get(current, set()):
             raise InvalidReportTransitionError(f"Cannot finalize report from {current}")
         report.report_status = ReportStatus.FINAL
@@ -191,7 +220,7 @@ class ReportService:
         recommendation: str | None = None,
     ) -> RadiologyReport:
         report = await self.get_report(report_id)
-        current = ReportStatus(report.report_status)
+        current = report.report_status
         if ReportStatus.AMENDED not in VALID_REPORT_TRANSITIONS.get(current, set()):
             raise InvalidReportTransitionError(f"Cannot amend report from {current}")
         report.report_status = ReportStatus.AMENDED
@@ -251,6 +280,7 @@ class ReportService:
     ) -> ReportVersion:
         version_num = await self.report_repo.get_next_version_number(report.id)
         version = ReportVersion(
+            tenant_id=report.tenant_id,
             report_id=report.id,
             version_number=version_num,
             status_at_version=report.report_status,
@@ -263,17 +293,38 @@ class ReportService:
         return await self.report_repo.create_version(version)
 
     async def _emit(self, event_type: str, report: RadiologyReport) -> None:
-        await event_bus.publish(
-            DomainEvent(
-                event_type=event_type,
-                payload={
-                    "report_id": str(report.id),
-                    "order_id": str(report.order_id),
-                    "status": report.report_status,
-                },
-                tenant_id=get_current_tenant_id(),
+        if event_type == "report.finalized":
+            await self._publish(
+                ReportFinalized(
+                    order_id=str(report.order_id),
+                    report_id=str(report.id),
+                    accession_number=report.accession_number,
+                    reported_by=str(report.reported_by) if report.reported_by else "",
+                    is_critical=report.is_critical,
+                    tenant_id=report.tenant_id,
+                )
             )
-        )
+            if report.is_critical:
+                await self._publish(
+                    CriticalFinding(
+                        order_id=str(report.order_id),
+                        report_id=str(report.id),
+                        finding_description="Critical finding on finalized report",
+                        tenant_id=report.tenant_id,
+                    )
+                )
+        else:
+            await self._publish(
+                DomainEvent(
+                    event_type=event_type,
+                    payload={
+                        "report_id": str(report.id),
+                        "order_id": str(report.order_id),
+                        "status": report.report_status,
+                    },
+                    tenant_id=report.tenant_id,
+                )
+            )
 
     # --- Template management ---
 

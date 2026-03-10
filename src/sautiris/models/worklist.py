@@ -49,6 +49,6 @@ class WorklistItem(TenantAwareBase):
     requested_procedure_id: Mapped[str | None] = mapped_column(String(64), default=None)
     requested_procedure_description: Mapped[str | None] = mapped_column(Text, default=None)
     referring_physician_name: Mapped[str | None] = mapped_column(String(255), default=None)
-    status: Mapped[str] = mapped_column(String(32), default=WorklistStatus.SCHEDULED)
-    mpps_status: Mapped[str | None] = mapped_column(String(32), default=None)
+    status: Mapped[WorklistStatus] = mapped_column(String(32), default=WorklistStatus.SCHEDULED)
+    mpps_status: Mapped[MPPSStatus | None] = mapped_column(String(32), default=None)
     mpps_uid: Mapped[str | None] = mapped_column(String(128), default=None)

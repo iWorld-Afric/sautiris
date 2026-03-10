@@ -8,7 +8,7 @@ from datetime import date
 
 from sqlalchemy import func, select
 
-from sautiris.models.report import RadiologyReport, ReportTemplate, ReportVersion
+from sautiris.models.report import RadiologyReport, ReportStatus, ReportTemplate, ReportVersion
 from sautiris.repositories.base import TenantAwareRepository
 
 
@@ -19,7 +19,7 @@ class ReportRepository(TenantAwareRepository[RadiologyReport]):
         self,
         *,
         order_id: uuid.UUID | None = None,
-        status: str | None = None,
+        status: ReportStatus | None = None,
         reported_by: uuid.UUID | None = None,
         is_critical: bool | None = None,
         date_from: date | None = None,

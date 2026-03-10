@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sautiris.api.deps import get_db, require_permission
 from sautiris.core.auth.base import AuthUser
+from sautiris.models.billing import CodeSystem
 from sautiris.services.billing_service import (
     BillingAssignmentNotFoundError,
     BillingCodeInactiveError,
@@ -28,14 +30,14 @@ router = APIRouter(prefix="/billing", tags=["billing"])
 class BillingAssign(BaseModel):
     order_id: uuid.UUID
     billing_code_id: uuid.UUID
-    quantity: int = 1
+    quantity: int = Field(default=1, ge=1)
 
 
 class BillingCodeResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
-    code_system: str
+    code_system: CodeSystem
     code: str
     display: str
     modality: str | None = None
@@ -58,7 +60,7 @@ class OrderBillingResponse(BaseModel):
 
 
 class RevenueSummaryItem(BaseModel):
-    code_system: str
+    code_system: CodeSystem
     assignment_count: int
     total_quantity: int
 
@@ -101,7 +103,7 @@ async def get_order_billing(
 @router.get("/codes", response_model=list[BillingCodeResponse])
 async def search_billing_codes(
     q: str | None = None,
-    code_system: str | None = None,
+    code_system: CodeSystem | None = None,
     modality: str | None = None,
     body_part: str | None = None,
     db: AsyncSession = Depends(get_db),
@@ -117,15 +119,10 @@ async def search_billing_codes(
 async def get_revenue_summary(
     date_from: date | None = None,
     date_to: date | None = None,
-    group_by: str = "code_system",
+    group_by: Literal["month", "modality", "code_system"] = "code_system",
     db: AsyncSession = Depends(get_db),
     user: AuthUser = Depends(require_permission("billing:read")),
 ) -> list[dict[str, object]]:
-    if group_by not in ("code_system", "modality", "month"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid group_by: {group_by}. Must be one of: code_system, modality, month",
-        )
     svc = BillingService(db)
     return await svc.get_revenue_summary(date_from=date_from, date_to=date_to, group_by=group_by)
 

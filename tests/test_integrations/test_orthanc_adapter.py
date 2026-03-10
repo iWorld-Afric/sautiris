@@ -139,3 +139,53 @@ class TestOrthancPACSAdapter:
         adapter._client = mock_client
         await adapter.health_check()
         mock_client.get.assert_awaited_once()
+
+    # -------------------------------------------------------------------------
+    # GAP-H8: delete_study() — not found returns False / found returns True
+    # -------------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_delete_study_not_found_returns_false(self) -> None:
+        """GAP-H8a: delete_study() returns False when /tools/lookup returns empty list."""
+        from unittest.mock import AsyncMock, patch
+
+        mock_http = AsyncMock()
+        mock_http.post.return_value = _mock_response(json_data=[])  # empty → not found
+        mock_http.delete = AsyncMock()
+
+        mock_ctx = AsyncMock()
+        mock_ctx.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        with patch(
+            "sautiris.integrations.pacs.orthanc.httpx.AsyncClient",
+            return_value=mock_ctx,
+        ):
+            result = await self.adapter.delete_study("1.2.3.4.5")
+
+        assert result is False
+        mock_http.delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delete_study_found_returns_true(self) -> None:
+        """GAP-H8b: delete_study() returns True when study is found and deleted."""
+        from unittest.mock import AsyncMock, patch
+
+        mock_http = AsyncMock()
+        mock_http.post.return_value = _mock_response(
+            json_data=[{"ID": "orthanc-internal-id-abc", "Type": "Study"}]
+        )
+        mock_http.delete.return_value = _mock_response(json_data={})
+
+        mock_ctx = AsyncMock()
+        mock_ctx.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        with patch(
+            "sautiris.integrations.pacs.orthanc.httpx.AsyncClient",
+            return_value=mock_ctx,
+        ):
+            result = await self.adapter.delete_study("1.2.3.4.5")
+
+        assert result is True
+        mock_http.delete.assert_called_once_with("/studies/orthanc-internal-id-abc")

@@ -188,3 +188,278 @@ async def test_list_rooms(schedule_service: ScheduleService) -> None:
     )
     rooms = await schedule_service.list_rooms()
     assert set(rooms) == {"ROOM-CT-1", "ROOM-MR-1"}
+
+
+# ---------------------------------------------------------------------------
+# GAP: ScheduleService._publish error logging
+# ---------------------------------------------------------------------------
+
+
+async def test_schedule_publish_handler_error_is_logged_as_warning(
+    db_session: AsyncSession,
+) -> None:
+    """ScheduleService._publish logs WARNING for each failing event handler.
+
+    ScheduleService uses logger.warning (not ERROR) for handler failures
+    because schedule events are not patient-safety critical.
+    """
+    from unittest.mock import patch
+
+    from sautiris.core.events import EventBus
+
+    bus = EventBus()
+
+    async def _failing_handler(event: object) -> None:
+        raise ValueError("schedule notification system down")
+
+    bus.subscribe("schedule.slot_created", _failing_handler)
+    svc = ScheduleService(db_session, event_bus=bus)
+
+    start = datetime.now(UTC) + timedelta(hours=5)
+    end = start + timedelta(minutes=30)
+
+    with patch("sautiris.services.schedule_service.logger") as mock_logger:
+        await svc.create_slot(
+            order_id=uuid.uuid4(),
+            room_id="ROOM-TEST-1",
+            modality="CT",
+            scheduled_start=start,
+            scheduled_end=end,
+        )
+        # _publish must call logger.warning for the handler failure
+        mock_logger.warning.assert_called()
+        warning_calls = mock_logger.warning.call_args_list
+        assert any("event_bus.handler_error" in str(call.args) for call in warning_calls), (
+            f"Expected 'event_bus.handler_error' in warnings. Got: {warning_calls}"
+        )
+
+
+async def test_schedule_publish_no_error_does_not_warn(
+    db_session: AsyncSession,
+) -> None:
+    """ScheduleService._publish does NOT warn when all handlers succeed."""
+    from unittest.mock import patch
+
+    from sautiris.core.events import EventBus
+
+    bus = EventBus()
+
+    async def _ok_handler(event: object) -> None:
+        pass  # success
+
+    bus.subscribe("schedule.slot_created", _ok_handler)
+    svc = ScheduleService(db_session, event_bus=bus)
+
+    start = datetime.now(UTC) + timedelta(hours=6)
+    end = start + timedelta(minutes=30)
+
+    with patch("sautiris.services.schedule_service.logger") as mock_logger:
+        await svc.create_slot(
+            order_id=uuid.uuid4(),
+            room_id="ROOM-TEST-OK",
+            modality="MR",
+            scheduled_start=start,
+            scheduled_end=end,
+        )
+        handler_error_warnings = [
+            call
+            for call in mock_logger.warning.call_args_list
+            if "event_bus.handler_error" in str(call.args)
+        ]
+        assert len(handler_error_warnings) == 0
+
+
+# ---------------------------------------------------------------------------
+# GAP-R4-2: update_slot conflict detection
+# ---------------------------------------------------------------------------
+
+
+async def test_update_slot_to_overlap_raises_conflict(
+    schedule_service: ScheduleService,
+) -> None:
+    """Updating a slot's time range to overlap an existing slot raises ScheduleConflictError."""
+    # Slot A: hours 10–10:30
+    start_a = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=10)
+    end_a = start_a + timedelta(minutes=30)
+    await schedule_service.create_slot(
+        order_id=uuid.uuid4(),
+        room_id="ROOM-CONFLICT-1",
+        modality="CT",
+        scheduled_start=start_a,
+        scheduled_end=end_a,
+    )
+
+    # Slot B: hours 11–11:30 (non-overlapping initially)
+    start_b = start_a + timedelta(hours=1)
+    end_b = start_b + timedelta(minutes=30)
+    slot_b = await schedule_service.create_slot(
+        order_id=uuid.uuid4(),
+        room_id="ROOM-CONFLICT-1",
+        modality="CT",
+        scheduled_start=start_b,
+        scheduled_end=end_b,
+    )
+
+    # Now update slot_b to overlap with slot_a (10:15–10:45 overlaps 10:00–10:30)
+    with pytest.raises(ScheduleConflictError):
+        await schedule_service.update_slot(
+            slot_b.id,
+            scheduled_start=start_a + timedelta(minutes=15),
+            scheduled_end=end_a + timedelta(minutes=15),
+        )
+
+
+async def test_update_slot_no_overlap_succeeds(
+    schedule_service: ScheduleService,
+) -> None:
+    """Updating a slot's time range to a non-overlapping window does not raise."""
+    base = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=20)
+    slot = await schedule_service.create_slot(
+        order_id=uuid.uuid4(),
+        room_id="ROOM-UPDATE-OK",
+        modality="MR",
+        scheduled_start=base,
+        scheduled_end=base + timedelta(minutes=30),
+    )
+    # Move to a completely different time — should succeed
+    new_start = base + timedelta(hours=3)
+    updated = await schedule_service.update_slot(
+        slot.id,
+        scheduled_start=new_start,
+        scheduled_end=new_start + timedelta(minutes=30),
+    )
+    # SQLite strips timezone when reading back; compare naive datetimes
+    updated_start = updated.scheduled_start
+    if hasattr(updated_start, "tzinfo") and updated_start.tzinfo is not None:
+        assert updated_start == new_start
+    else:
+        assert updated_start == new_start.replace(tzinfo=None)
+
+
+# ---------------------------------------------------------------------------
+# GAP-R4-4: detect_conflicts and check_availability
+# ---------------------------------------------------------------------------
+
+
+async def test_detect_conflicts_returns_overlapping_slots(
+    schedule_service: ScheduleService,
+) -> None:
+    """detect_conflicts returns all slots that overlap the given time window."""
+    base = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=30)
+    # Create one slot in ROOM-DETECT at base to base+30
+    await schedule_service.create_slot(
+        order_id=uuid.uuid4(),
+        room_id="ROOM-DETECT",
+        modality="CT",
+        scheduled_start=base,
+        scheduled_end=base + timedelta(minutes=30),
+    )
+
+    # Query a window that overlaps (base+15 to base+45)
+    conflicts = await schedule_service.detect_conflicts(
+        room_id="ROOM-DETECT",
+        start=base + timedelta(minutes=15),
+        end=base + timedelta(minutes=45),
+    )
+    assert len(conflicts) == 1
+
+
+async def test_detect_conflicts_non_overlapping_returns_empty(
+    schedule_service: ScheduleService,
+) -> None:
+    """detect_conflicts returns empty list when no slots overlap the window."""
+    base = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=35)
+    await schedule_service.create_slot(
+        order_id=uuid.uuid4(),
+        room_id="ROOM-DETECT-EMPTY",
+        modality="MR",
+        scheduled_start=base,
+        scheduled_end=base + timedelta(minutes=30),
+    )
+
+    # Query a window entirely after the slot
+    conflicts = await schedule_service.detect_conflicts(
+        room_id="ROOM-DETECT-EMPTY",
+        start=base + timedelta(hours=1),
+        end=base + timedelta(hours=2),
+    )
+    assert conflicts == []
+
+
+async def test_check_availability_returns_available_slots(
+    schedule_service: ScheduleService,
+) -> None:
+    """check_availability returns only AVAILABLE slots matching the filter criteria."""
+    base = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=40)
+
+    # Create two AVAILABLE CT slots
+    await schedule_service.create_slot(
+        order_id=uuid.uuid4(),
+        room_id="ROOM-AVAIL-1",
+        modality="CT",
+        scheduled_start=base,
+        scheduled_end=base + timedelta(minutes=30),
+    )
+    await schedule_service.create_slot(
+        order_id=uuid.uuid4(),
+        room_id="ROOM-AVAIL-2",
+        modality="CT",
+        scheduled_start=base + timedelta(hours=1),
+        scheduled_end=base + timedelta(hours=1, minutes=30),
+    )
+
+    available = await schedule_service.check_availability(modality="CT")
+    # At least the two we just created must appear
+    assert len(available) >= 2
+    assert all(str(s.status) == "AVAILABLE" for s in available)
+
+
+async def test_check_availability_filters_by_modality(
+    schedule_service: ScheduleService,
+) -> None:
+    """check_availability with modality filter excludes slots of other modalities."""
+    base = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=45)
+
+    await schedule_service.create_slot(
+        order_id=uuid.uuid4(),
+        room_id="ROOM-MR-AVAIL",
+        modality="MR",
+        scheduled_start=base,
+        scheduled_end=base + timedelta(minutes=30),
+    )
+
+    # Filter by a different modality — should not include the MR slot
+    available = await schedule_service.check_availability(modality="NM")
+    mr_ids = [s.id for s in available if s.modality == "MR"]
+    assert mr_ids == []
+
+
+# ---------------------------------------------------------------------------
+# GAP-M1: ScheduleService.update_slot() — unknown field warning
+# ---------------------------------------------------------------------------
+
+
+async def test_update_slot_unknown_field_logs_warning(
+    schedule_service: ScheduleService,
+) -> None:
+    """GAP-M1: Passing an unknown field to update_slot() logs a warning and does not crash."""
+    from unittest.mock import patch
+
+    start, end = _make_times(offset_hours=50)
+    slot = await schedule_service.create_slot(
+        order_id=uuid.uuid4(),
+        room_id="ROOM-UNKNOWN-FIELD",
+        modality="CT",
+        scheduled_start=start,
+        scheduled_end=end,
+    )
+
+    with patch("sautiris.services.schedule_service.logger") as mock_logger:
+        updated = await schedule_service.update_slot(
+            slot.id, nonexistent_schedule_field="should_be_ignored"
+        )
+
+    assert updated is not None  # no crash
+    mock_logger.warning.assert_called()
+    warning_key = mock_logger.warning.call_args[0][0]
+    assert "unknown_fields" in warning_key

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 from pydicom.dataset import Dataset
+from pydicom.uid import generate_uid
 from pynetdicom import AE, evt
 
 if TYPE_CHECKING:
@@ -25,19 +26,38 @@ logger = structlog.get_logger(__name__)
 # Modality Worklist Information Model - FIND SOP Class
 MWL_FIND_SOP_CLASS = "1.2.840.10008.5.1.4.31"
 
+# SpecificCharacterSet for UTF-8 (ISO_IR 192) — Issue #5
+CHARSET_UTF8 = "ISO_IR 192"
+
+# Transfer syntaxes supported by this SCP — Issue #9
+TRANSFER_SYNTAXES: list[str] = [
+    "1.2.840.10008.1.2.1",    # Explicit VR Little Endian
+    "1.2.840.10008.1.2",      # Implicit VR Little Endian
+    "1.2.840.10008.1.2.4.50", # JPEG Baseline (Process 1)
+    "1.2.840.10008.1.2.4.70", # JPEG Lossless (Process 14 SV1)
+    "1.2.840.10008.1.2.4.90", # JPEG 2000 Lossless Only
+    "1.2.840.10008.1.2.4.91", # JPEG 2000
+    "1.2.840.10008.1.2.5",    # RLE Lossless
+    "1.2.840.10008.1.2.1.99", # Deflated Explicit VR Little Endian
+]
+
 
 def worklist_item_to_dataset(item: WorklistItem) -> Dataset:
     """Convert a WorklistItem DB record to a DICOM MWL response dataset.
 
-    Maps WorklistItem fields to the standard DICOM MWL response tags:
-    - Patient-level: PatientName, PatientID, PatientBirthDate, PatientSex
-    - Procedure-level: AccessionNumber, ReferringPhysicianName,
-      RequestedProcedureID, RequestedProcedureDescription
-    - Scheduled Procedure Step Sequence: Modality, ScheduledStationAETitle,
-      ScheduledProcedureStepStartDate/Time, ScheduledProcedureStepID,
-      ScheduledProcedureStepDescription
+    Includes all required Type 1, Type 1C, and Type 2 tags per DICOM
+    PS3.4 Annex K (Modality Worklist Information Model).
+
+    Issue #3: adds StudyInstanceUID, ReferencedStudySequence,
+    RequestedProcedureCodeSequence, RequestAttributesSequence, StudyID,
+    StudyDate, StudyTime, RequestedProcedurePriority, PatientWeight,
+    MedicalAlerts, Allergies, PregnancyStatus.
+    Issue #5: sets SpecificCharacterSet = ISO_IR 192 as the first tag.
     """
     ds = Dataset()
+
+    # Issue #5 — MUST be the first tag in every outbound dataset
+    ds.SpecificCharacterSet = CHARSET_UTF8
 
     # Patient-level attributes
     ds.PatientName = item.patient_name or ""
@@ -50,11 +70,42 @@ def worklist_item_to_dataset(item: WorklistItem) -> Dataset:
         ds.PatientBirthDate = ""
     ds.PatientSex = item.patient_sex or ""
 
+    # Type 2 patient tags (required, may be zero-length)
+    ds.PatientWeight = str(getattr(item, "patient_weight", "") or "")
+    ds.MedicalAlerts = str(getattr(item, "medical_alerts", "") or "")
+    ds.Allergies = str(getattr(item, "allergies", "") or "")
+    pregnancy = getattr(item, "pregnancy_status", None)
+    if pregnancy is not None:
+        ds.PregnancyStatus = int(pregnancy)
+
     # Procedure-level attributes
     ds.AccessionNumber = item.accession_number or ""
     ds.ReferringPhysicianName = item.referring_physician_name or ""
     ds.RequestedProcedureID = item.requested_procedure_id or ""
     ds.RequestedProcedureDescription = item.requested_procedure_description or ""
+    ds.RequestedProcedurePriority = str(getattr(item, "requested_procedure_priority", "") or "")
+
+    # Type 1 — StudyInstanceUID: generate a new UID if the item has no study UID yet
+    study_uid = getattr(item, "study_instance_uid", None)
+    ds.StudyInstanceUID = study_uid if study_uid else generate_uid()
+
+    # Type 2 study-level tags
+    ds.StudyID = str(getattr(item, "study_id", "") or "")
+    if item.scheduled_start and isinstance(item.scheduled_start, datetime):
+        ds.StudyDate = item.scheduled_start.strftime("%Y%m%d")
+        ds.StudyTime = item.scheduled_start.strftime("%H%M%S")
+    else:
+        ds.StudyDate = ""
+        ds.StudyTime = ""
+
+    # Type 1C — empty if no referenced study
+    ds.ReferencedStudySequence = []
+
+    # Type 1C — empty if no procedure code
+    ds.RequestedProcedureCodeSequence = []
+
+    # Type 2 — RequestAttributesSequence (empty sequence is valid)
+    ds.RequestAttributesSequence = []
 
     # Scheduled Procedure Step Sequence
     sps = Dataset()
@@ -62,6 +113,7 @@ def worklist_item_to_dataset(item: WorklistItem) -> Dataset:
     sps.ScheduledStationAETitle = item.scheduled_station_ae_title or ""
     sps.ScheduledProcedureStepID = item.scheduled_procedure_step_id or ""
     sps.ScheduledProcedureStepDescription = item.scheduled_procedure_step_description or ""
+    sps.ScheduledProcedureStepStatus = str(getattr(item, "status", "") or "")
 
     if item.scheduled_start:
         if isinstance(item.scheduled_start, datetime):
@@ -82,12 +134,32 @@ def worklist_item_to_dataset(item: WorklistItem) -> Dataset:
 def extract_query_filters(identifier: Dataset) -> dict[str, Any]:
     """Extract query filters from a C-FIND request identifier dataset.
 
-    Parses the incoming DICOM C-FIND request and returns a dict of filters
-    that can be passed to the worklist repository's ``list_with_filters``.
+    Implements DICOM universal matching: an absent or zero-length value in
+    the query means "match all" (no filter added for that attribute).
+
+    Issue #3: adds PatientID, PatientName, AccessionNumber,
+    RequestedProcedureID, and ScheduledProcedureStepStatus filters.
     """
     filters: dict[str, Any] = {}
 
-    # Check Scheduled Procedure Step Sequence for modality/AE title
+    # Top-level patient / procedure attributes (universal matching)
+    patient_id = getattr(identifier, "PatientID", None)
+    if patient_id and str(patient_id).strip():
+        filters["patient_id"] = str(patient_id).strip()
+
+    patient_name = getattr(identifier, "PatientName", None)
+    if patient_name and str(patient_name).strip():
+        filters["patient_name"] = str(patient_name).strip()
+
+    accession = getattr(identifier, "AccessionNumber", None)
+    if accession and str(accession).strip():
+        filters["accession_number"] = str(accession).strip()
+
+    rp_id = getattr(identifier, "RequestedProcedureID", None)
+    if rp_id and str(rp_id).strip():
+        filters["requested_procedure_id"] = str(rp_id).strip()
+
+    # Check Scheduled Procedure Step Sequence for modality/AE title/date/status
     sps_seq = getattr(identifier, "ScheduledProcedureStepSequence", None)
     if sps_seq and len(sps_seq) > 0:
         sps = sps_seq[0]
@@ -98,6 +170,10 @@ def extract_query_filters(identifier: Dataset) -> dict[str, Any]:
         ae_title = getattr(sps, "ScheduledStationAETitle", None)
         if ae_title and str(ae_title).strip():
             filters["scheduled_station_ae_title"] = str(ae_title).strip()
+
+        sps_status = getattr(sps, "ScheduledProcedureStepStatus", None)
+        if sps_status and str(sps_status).strip():
+            filters["scheduled_procedure_step_status"] = str(sps_status).strip()
 
         # Date range from ScheduledProcedureStepStartDate
         start_date = getattr(sps, "ScheduledProcedureStepStartDate", None)
@@ -132,6 +208,8 @@ class MWLServer:
         query_callback: Async callable that receives filter dict and returns
             list of WorklistItem objects.
         loop: The asyncio event loop to run async callbacks on.
+        bind_address: IP address to bind to (default ``"127.0.0.1"``).
+            Issue #17: changed default from 0.0.0.0 to localhost-only.
     """
 
     def __init__(
@@ -140,11 +218,13 @@ class MWLServer:
         port: int = 11112,
         query_callback: Callable[..., Any] | None = None,
         loop: asyncio.AbstractEventLoop | None = None,
+        bind_address: str = "127.0.0.1",
     ) -> None:
         self.ae_title = ae_title
         self.port = port
         self._query_callback = query_callback
         self._loop = loop
+        self._bind_address = bind_address
         self._ae: AE | None = None
 
     def _handle_find(self, event: Event) -> Any:
@@ -158,24 +238,32 @@ class MWLServer:
         if self._query_callback and self._loop:
             future = asyncio.run_coroutine_threadsafe(self._query_callback(filters), self._loop)
             try:
-                items = future.result(timeout=10.0)
+                items = future.result(timeout=5.0)  # Reduced from 10 s to bound thread time
             except Exception:
                 logger.exception("mwl.query_callback_error")
                 yield 0xC001, None
                 return
 
         for item in items:
-            ds = worklist_item_to_dataset(item)
-            yield 0xFF00, ds
+            try:
+                ds = worklist_item_to_dataset(item)
+                yield 0xFF00, ds
+            except Exception:
+                logger.error(
+                    "mwl.item_conversion_error",
+                    item_id=str(getattr(item, "id", "unknown")),
+                    exc_info=True,
+                )
 
     def start(self) -> None:
         """Start the MWL SCP in non-blocking mode."""
         self._ae = AE(ae_title=self.ae_title)
-        self._ae.add_supported_context(MWL_FIND_SOP_CLASS)
+        # Issue #9 — register all 8 supported transfer syntaxes
+        self._ae.add_supported_context(MWL_FIND_SOP_CLASS, TRANSFER_SYNTAXES)
 
         handlers = [(evt.EVT_C_FIND, self._handle_find)]
         self._ae.start_server(
-            ("0.0.0.0", self.port),
+            (self._bind_address, self.port),
             block=False,
             evt_handlers=handlers,  # type: ignore[arg-type]
         )

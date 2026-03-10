@@ -39,3 +39,41 @@ async def test_audit_log_creates_entry(db_session: AsyncSession) -> None:
     assert logs[0].action == "READ"
     assert logs[0].resource_type == "ORDER"
     assert logs[0].user_id == TEST_USER.user_id
+
+
+@pytest.mark.asyncio
+async def test_audit_log_stores_correlation_id(db_session: AsyncSession) -> None:
+    """AuditLogger.log() must store correlation_id in the audit_logs table."""
+    logger = AuditLogger(db_session)
+    corr_id = "req-abc-123"
+    await logger.log(
+        user=TEST_USER,
+        action="READ",
+        resource_type="ORDER",
+        resource_id=uuid.uuid4(),
+        ip_address="10.0.0.1",
+        correlation_id=corr_id,
+    )
+    await db_session.commit()
+
+    result = await db_session.execute(select(AuditLog))
+    logs = result.scalars().all()
+    assert len(logs) >= 1
+    last = logs[-1]
+    assert last.correlation_id == corr_id
+
+
+@pytest.mark.asyncio
+async def test_audit_log_correlation_id_optional(db_session: AsyncSession) -> None:
+    """correlation_id defaults to None when not provided."""
+    logger = AuditLogger(db_session)
+    await logger.log(
+        user=TEST_USER,
+        action="WRITE",
+        resource_type="REPORT",
+    )
+    await db_session.commit()
+
+    result = await db_session.execute(select(AuditLog))
+    logs = result.scalars().all()
+    assert any(lg.correlation_id is None for lg in logs)

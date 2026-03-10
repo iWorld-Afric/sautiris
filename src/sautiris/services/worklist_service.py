@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from datetime import date, datetime
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sautiris.core.events import DomainEvent, event_bus
-from sautiris.core.tenancy import get_current_tenant_id
+from sautiris.core.events import DomainEvent, EventBus, ExamCompleted, ExamStarted
 from sautiris.models.worklist import MPPSStatus, WorklistItem, WorklistStatus
 from sautiris.repositories.worklist import WorklistRepository
 
@@ -32,9 +31,32 @@ class InvalidWorklistTransitionError(Exception):
 
 
 class WorklistService:
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, event_bus: EventBus | None = None) -> None:
         self.session = session
         self.repo = WorklistRepository(session)
+        self._event_bus = event_bus
+
+    async def _publish(self, event: DomainEvent) -> None:
+        """Publish a domain event if an event bus is configured."""
+        if self._event_bus is not None:
+            errors = await self._event_bus.publish(event)
+            if errors:
+                for exc in errors:
+                    logger.error(
+                        "event_bus.handler_error",
+                        event_type=event.event_type,
+                        error=str(exc),
+                    )
+                if isinstance(event, ExamCompleted):
+                    logger.error(
+                        "event_bus.exam_completed_handlers_failed",
+                        event_type=event.event_type,
+                        error_count=len(errors),
+                        msg=(
+                            "ExamCompleted handlers failed — workflow-critical event "
+                            "may not have been delivered"
+                        ),
+                    )
 
     async def create_worklist_item(
         self,
@@ -50,7 +72,7 @@ class WorklistService:
         scheduled_station_ae_title: str | None = None,
         scheduled_procedure_step_id: str | None = None,
         scheduled_procedure_step_description: str | None = None,
-        scheduled_start: object | None = None,
+        scheduled_start: datetime | None = None,
         requested_procedure_id: str | None = None,
         requested_procedure_description: str | None = None,
         referring_physician_name: str | None = None,
@@ -87,7 +109,7 @@ class WorklistService:
         self,
         *,
         modality: str | None = None,
-        status: str | None = None,
+        status: WorklistStatus | None = None,
         scheduled_station_ae_title: str | None = None,
         date_from: date | None = None,
         date_to: date | None = None,
@@ -112,7 +134,7 @@ class WorklistService:
         new_status: WorklistStatus,
     ) -> WorklistItem:
         item = await self.get_item(item_id)
-        current = WorklistStatus(item.status)
+        current = item.status
         allowed = VALID_WL_TRANSITIONS.get(current, set())
         if new_status not in allowed:
             raise InvalidWorklistTransitionError(
@@ -121,11 +143,18 @@ class WorklistService:
         old_status = item.status
         item.status = new_status
         updated = await self.repo.update(item)
-        await self._emit(
-            "worklist.status_changed",
-            updated,
-            extra={"from_status": old_status, "to_status": str(new_status)},
-        )
+
+        if new_status == WorklistStatus.IN_PROGRESS:
+            await self._emit("exam.started", updated)
+        elif new_status == WorklistStatus.COMPLETED:
+            await self._emit("exam.completed", updated)
+        else:
+            await self._emit(
+                "worklist.status_changed",
+                updated,
+                extra={"from_status": old_status, "to_status": str(new_status)},
+            )
+
         logger.info(
             "worklist_status_changed",
             item_id=str(item_id),
@@ -137,7 +166,7 @@ class WorklistService:
         self,
         item_id: uuid.UUID,
         *,
-        mpps_status: str,
+        mpps_status: MPPSStatus,
         mpps_uid: str | None = None,
     ) -> WorklistItem:
         item = await self.get_item(item_id)
@@ -172,17 +201,34 @@ class WorklistService:
         *,
         extra: dict[str, str] | None = None,
     ) -> None:
-        payload: dict[str, str] = {
-            "item_id": str(item.id),
-            "order_id": str(item.order_id),
-            "status": str(item.status),
-        }
-        if extra:
-            payload.update(extra)
-        await event_bus.publish(
-            DomainEvent(
-                event_type=event_type,
-                payload=payload,
-                tenant_id=get_current_tenant_id(),
+        if event_type == "exam.started":
+            await self._publish(
+                ExamStarted(
+                    order_id=str(item.order_id),
+                    worklist_item_id=str(item.id),
+                    tenant_id=item.tenant_id,
+                )
             )
-        )
+        elif event_type == "exam.completed":
+            await self._publish(
+                ExamCompleted(
+                    order_id=str(item.order_id),
+                    worklist_item_id=str(item.id),
+                    tenant_id=item.tenant_id,
+                )
+            )
+        else:
+            payload: dict[str, str] = {
+                "item_id": str(item.id),
+                "order_id": str(item.order_id),
+                "status": str(item.status),
+            }
+            if extra:
+                payload.update(extra)
+            await self._publish(
+                DomainEvent(
+                    event_type=event_type,
+                    payload=payload,
+                    tenant_id=item.tenant_id,
+                )
+            )

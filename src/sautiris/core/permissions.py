@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from enum import StrEnum
 
 
@@ -102,7 +103,7 @@ ROLE_PERMISSIONS: dict[str, set[Permission]] = {
 }
 
 
-def get_permissions_for_roles(roles: list[str]) -> set[Permission]:
+def get_permissions_for_roles(roles: Sequence[str]) -> set[Permission]:
     """Gather all permissions granted by the user's roles."""
     perms: set[Permission] = set()
     for role in roles:
@@ -112,6 +113,6 @@ def get_permissions_for_roles(roles: list[str]) -> set[Permission]:
     return perms
 
 
-def has_permission(roles: list[str], permission: Permission) -> bool:
+def has_permission(roles: Sequence[str], permission: Permission) -> bool:
     """Check if any of the given roles grants the specified permission."""
     return permission in get_permissions_for_roles(roles)

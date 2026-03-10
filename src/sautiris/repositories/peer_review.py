@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
+from datetime import datetime
 
 from sqlalchemy import func, select
 
-from sautiris.models.peer_review import Discrepancy, PeerReview
+from sautiris.models.peer_review import AgreementScore, Discrepancy, PeerReview, ReviewType
 from sautiris.repositories.base import TenantAwareRepository
 
 
@@ -17,8 +18,8 @@ class PeerReviewRepository(TenantAwareRepository[PeerReview]):
     async def list_filtered(
         self,
         *,
-        review_type: str | None = None,
-        agreement_score: str | None = None,
+        review_type: ReviewType | None = None,
+        agreement_score: AgreementScore | None = None,
         reviewer_id: uuid.UUID | None = None,
         offset: int = 0,
         limit: int = 100,
@@ -78,8 +79,8 @@ class PeerReviewRepository(TenantAwareRepository[PeerReview]):
         self,
         radiologist_id: uuid.UUID,
         *,
-        start: str,
-        end: str,
+        start: datetime,
+        end: datetime,
     ) -> float | None:
         """Compute agreement rate for a radiologist in a date range.
 
@@ -100,7 +101,7 @@ class PeerReviewRepository(TenantAwareRepository[PeerReview]):
         agree_stmt = select(func.count(self.model.id)).where(
             self.model.tenant_id == self._tenant_id,
             self.model.reviewer_id == radiologist_id,
-            self.model.agreement_score == "AGREE",
+            self.model.agreement_score == AgreementScore.AGREE,
             self.model.reviewed_at >= start,
             self.model.reviewed_at < end,
         )

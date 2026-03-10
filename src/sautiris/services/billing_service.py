@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
+from typing import Literal
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -96,7 +97,7 @@ class BillingService:
         *,
         date_from: date | None = None,
         date_to: date | None = None,
-        group_by: str = "code_system",
+        group_by: Literal["month", "modality", "code_system"] = "code_system",
     ) -> list[dict[str, object]]:
         return await self.billing_repo.get_revenue_summary(
             date_from=date_from, date_to=date_to, group_by=group_by

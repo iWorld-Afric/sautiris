@@ -7,7 +7,7 @@ from datetime import date
 
 from sqlalchemy import func, select
 
-from sautiris.models.worklist import WorklistItem
+from sautiris.models.worklist import WorklistItem, WorklistStatus
 from sautiris.repositories.base import TenantAwareRepository
 
 
@@ -26,7 +26,7 @@ class WorklistRepository(TenantAwareRepository[WorklistItem]):
         self,
         *,
         modality: str | None = None,
-        status: str | None = None,
+        status: WorklistStatus | None = None,
         scheduled_station_ae_title: str | None = None,
         date_from: date | None = None,
         date_to: date | None = None,
