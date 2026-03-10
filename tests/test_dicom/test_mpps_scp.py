@@ -417,6 +417,29 @@ class TestInvokeCallbackErrorHandling:
             loop.close()
 
 
+class TestInvokeCallbackTimeout:
+    """M13: TimeoutError in _invoke_callback returns 0xC001 with specific log."""
+
+    def test_callback_timeout_on_n_create_returns_processing_error(self) -> None:
+        """Callback timeout → 0xC001, instance rolled back from _instances."""
+        from unittest.mock import patch
+
+        mock_future = MagicMock()
+        mock_future.result.side_effect = TimeoutError("timed out")
+
+        server = MPPSServer(status_callback=lambda *a: None, loop=MagicMock())
+        uid = "1.2.3.timeout.1"
+        event = _make_n_create_event(uid, MPPS_STATUS_IN_PROGRESS)
+
+        with patch("asyncio.run_coroutine_threadsafe", return_value=mock_future):
+            status, ds = server._handle_n_create(event)
+
+        assert status == 0xC001
+        assert ds is None
+        # Instance should be rolled back
+        assert uid not in server._instances
+
+
 class TestIssue14RequiredAttributes:
     """PS3.4 F.7.2 — required Type 1 attributes on N-CREATE and N-SET."""
 

@@ -120,10 +120,17 @@ class AlertService(EventPublisherMixin):
                 alert_id=created.id,
             )
         except Exception as exc:
-            created.notification_failed = True
-            created.notification_error = str(exc)
-            await self.repo.update(created)
-            await self.session.flush()
+            try:
+                created.notification_failed = True
+                created.notification_error = str(exc)[:500]
+                await self.repo.update(created)
+                await self.session.flush()
+            except Exception:
+                logger.critical(
+                    "alert.notification_failure_persistence_failed",
+                    alert_id=str(created.id),
+                    exc_info=True,
+                )
             logger.critical(
                 "alert.notification_dispatch_failed",
                 alert_id=str(created.id),
@@ -333,7 +340,7 @@ class AlertService(EventPublisherMixin):
                 updated.notification_error = None
             except Exception as exc:
                 dispatch_failed = True
-                dispatch_error = str(exc)
+                dispatch_error = str(exc)[:500]
                 updated.notification_failed = True
                 updated.notification_error = dispatch_error
                 any_modified = True

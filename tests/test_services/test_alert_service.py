@@ -486,6 +486,50 @@ class TestCheckEscalationNotificationFailedPersisted:
         assert "notification service down" in alert.notification_error
 
 
+class TestCheckEscalationClearOnSuccess:
+    """R5-H2: verify check_escalation clears notification_failed on re-dispatch success."""
+
+    async def test_notification_failed_cleared_on_successful_redispatch(
+        self, db_session: AsyncSession, order: object
+    ) -> None:
+        """Alerts with notification_failed=True get cleared after successful re-dispatch."""
+
+        call_count = 0
+
+        class _FailOnceThenSucceed:
+            async def dispatch(self, **kwargs: object) -> None:
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    raise RuntimeError("first dispatch fails")
+                # subsequent calls succeed
+
+        dispatcher = _FailOnceThenSucceed()
+        svc = AlertService(
+            db_session,
+            notification_dispatcher=dispatcher,
+            escalation_timeout_minutes=0,  # escalate immediately
+        )
+        alert = await svc.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.CRITICAL_FINDING,
+            finding_description="Test finding",
+        )
+        await db_session.refresh(alert)
+        assert alert.notification_failed is True
+
+        # Backdate so it's eligible for escalation
+        alert.created_at = datetime.now(UTC) - timedelta(minutes=5)  # type: ignore[assignment]
+        await db_session.flush()
+
+        # Second dispatch will succeed — should clear notification_failed
+        escalated = await svc.check_escalation()
+        assert len(escalated) == 1
+        await db_session.refresh(escalated[0])
+        assert escalated[0].notification_failed is False
+        assert escalated[0].notification_error is None
+
+
 class TestCreateAlertNotificationFailedTracked:
     """H2: verify create_alert() tracks notification failure."""
 
