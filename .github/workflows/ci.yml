@@ -34,7 +34,7 @@ jobs:
       SAUTIRIS_DATABASE_URL: "postgresql+asyncpg://sautiris_test:sautiris_test@localhost:5432/sautiris_test"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
