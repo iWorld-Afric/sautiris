@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC
 from unittest.mock import AsyncMock
 
 import pytest
@@ -215,6 +216,7 @@ class TestConcreteEvents:
     def test_critical_finding(self) -> None:
         event = CriticalFinding(
             order_id="ORD-001",
+            report_id="RPT-001",
             finding_description="Pneumothorax",
             urgency="IMMEDIATE",
         )
@@ -392,3 +394,639 @@ class TestServiceEmitsTypedEvents:
 
         assert len(captured) == 1
         assert isinstance(captured[0], DRLExceeded)
+
+
+# ---------------------------------------------------------------------------
+# Issue #16: New typed event dataclass tests
+# ---------------------------------------------------------------------------
+
+
+class TestNewTypedEvents:
+    """Tests for typed events added in Issue #16."""
+
+    def test_order_cancelled_defaults(self) -> None:
+        from sautiris.core.events import OrderCancelled
+
+        # order_id is required by __post_init__ validation (#45)
+        event = OrderCancelled(order_id="ORD-001")
+        assert event.event_type == "order.cancelled"
+        assert event.order_id == "ORD-001"
+        assert event.reason == ""
+        assert event.from_status == ""
+        assert event.event_id is not None
+
+    def test_order_cancelled_with_data(self) -> None:
+        from sautiris.core.events import OrderCancelled
+
+        event = OrderCancelled(
+            order_id="ORD-001", from_status="REQUESTED", reason="Patient no-show"
+        )
+        assert event.event_type == "order.cancelled"
+        assert event.order_id == "ORD-001"
+        assert event.reason == "Patient no-show"
+        assert event.from_status == "REQUESTED"
+
+    def test_order_reported(self) -> None:
+        from sautiris.core.events import OrderReported
+
+        event = OrderReported(order_id="ORD-001", from_status="COMPLETED")
+        assert event.event_type == "order.reported"
+        assert event.order_id == "ORD-001"
+        assert event.from_status == "COMPLETED"
+
+    def test_order_verified(self) -> None:
+        from sautiris.core.events import OrderVerified
+
+        event = OrderVerified(order_id="ORD-001", from_status="REPORTED")
+        assert event.event_type == "order.verified"
+        assert event.order_id == "ORD-001"
+
+    def test_order_distributed(self) -> None:
+        from sautiris.core.events import OrderDistributed
+
+        event = OrderDistributed(order_id="ORD-001", from_status="VERIFIED")
+        assert event.event_type == "order.distributed"
+        assert event.order_id == "ORD-001"
+
+    def test_report_created(self) -> None:
+        from sautiris.core.events import ReportCreated
+
+        event = ReportCreated(
+            report_id="RPT-001",
+            order_id="ORD-001",
+            accession_number="ACC-001",
+            reported_by="USR-001",
+        )
+        assert event.event_type == "report.created"
+        assert event.report_id == "RPT-001"
+        assert event.accession_number == "ACC-001"
+
+    def test_report_amended(self) -> None:
+        from sautiris.core.events import ReportAmended
+
+        event = ReportAmended(
+            report_id="RPT-001",
+            order_id="ORD-001",
+            accession_number="ACC-001",
+            changed_by="USR-002",
+        )
+        assert event.event_type == "report.amended"
+        assert event.changed_by == "USR-002"
+
+    def test_worklist_status_changed(self) -> None:
+        from sautiris.core.events import WorklistStatusChanged
+
+        event = WorklistStatusChanged(
+            item_id="WL-001",
+            order_id="ORD-001",
+            from_status="SCHEDULED",
+            to_status="DISCONTINUED",
+        )
+        assert event.event_type == "worklist.status_changed"
+        assert event.from_status == "SCHEDULED"
+        assert event.to_status == "DISCONTINUED"
+
+    def test_worklist_mpps_received(self) -> None:
+        from sautiris.core.events import WorklistMPPSReceived
+
+        event = WorklistMPPSReceived(
+            item_id="WL-001",
+            order_id="ORD-001",
+            mpps_status="COMPLETED",
+            mpps_uid="1.2.3.4",
+        )
+        assert event.event_type == "worklist.mpps_received"
+        assert event.mpps_status == "COMPLETED"
+        assert event.mpps_uid == "1.2.3.4"
+
+    def test_schedule_slot_created(self) -> None:
+        from sautiris.core.events import ScheduleSlotCreated
+
+        event = ScheduleSlotCreated(
+            slot_id="SLOT-001",
+            order_id="ORD-001",
+            room_id="CT-1",
+            modality="CT",
+            status="AVAILABLE",
+        )
+        assert event.event_type == "schedule.slot_created"
+        assert event.room_id == "CT-1"
+        assert event.modality == "CT"
+
+    def test_schedule_slot_updated(self) -> None:
+        from sautiris.core.events import ScheduleSlotUpdated
+
+        event = ScheduleSlotUpdated(
+            slot_id="SLOT-001",
+            order_id="ORD-001",
+            room_id="CT-2",
+            modality="CT",
+            status="BOOKED",
+        )
+        assert event.event_type == "schedule.slot_updated"
+        assert event.room_id == "CT-2"
+
+    def test_new_events_cannot_override_event_type(self) -> None:
+        """All new typed events use field(init=False) so event_type is immutable.
+
+        Note: OrderCancelled requires order_id due to __post_init__ validation (#45).
+        """
+        from sautiris.core.events import (
+            OrderCancelled,
+            OrderDistributed,
+            OrderReported,
+            OrderVerified,
+            ReportAmended,
+            ReportCreated,
+            ScheduleSlotCreated,
+            ScheduleSlotUpdated,
+            WorklistMPPSReceived,
+            WorklistStatusChanged,
+        )
+
+        # Events without __post_init__ validation can be instantiated with defaults
+        for cls, expected_type in [
+            (OrderReported, "order.reported"),
+            (OrderVerified, "order.verified"),
+            (OrderDistributed, "order.distributed"),
+            (ReportCreated, "report.created"),
+            (ReportAmended, "report.amended"),
+            (WorklistStatusChanged, "worklist.status_changed"),
+            (WorklistMPPSReceived, "worklist.mpps_received"),
+            (ScheduleSlotCreated, "schedule.slot_created"),
+            (ScheduleSlotUpdated, "schedule.slot_updated"),
+        ]:
+            event = cls()
+            assert event.event_type == expected_type, f"{cls.__name__} has wrong event_type"
+
+        # OrderCancelled requires order_id
+        event = OrderCancelled(order_id="ORD-001")
+        assert event.event_type == "order.cancelled"
+
+
+# ---------------------------------------------------------------------------
+# Issue #16: Service typed event emission tests
+# ---------------------------------------------------------------------------
+
+
+class TestServiceEmitsNewTypedEvents:
+    """Verify services emit typed events instead of generic DomainEvent."""
+
+    @pytest.mark.asyncio
+    async def test_order_service_cancel_emits_order_cancelled(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from sautiris.core.events import OrderCancelled
+        from sautiris.services.order_service import OrderService
+
+        bus = EventBus()
+        captured: list[DomainEvent] = []
+
+        async def capture(event: DomainEvent) -> None:
+            captured.append(event)
+
+        bus.subscribe("order.cancelled", capture)
+
+        mock_session = AsyncMock()
+        svc = OrderService(mock_session, event_bus=bus)
+        mock_order = MagicMock()
+        mock_order.id = __import__("uuid").uuid4()
+        mock_order.tenant_id = __import__("uuid").uuid4()
+        mock_order.status = "REQUESTED"
+        mock_order.special_instructions = None
+        svc.repo = AsyncMock()
+        svc.repo.get_by_id.return_value = mock_order
+        svc.repo.update.return_value = mock_order
+
+        await svc.cancel_order(mock_order.id, reason="Patient no-show")
+
+        assert len(captured) == 1
+        assert isinstance(captured[0], OrderCancelled)
+        assert captured[0].order_id == str(mock_order.id)
+        assert captured[0].reason == "Patient no-show"
+        assert captured[0].from_status == "REQUESTED"
+
+    @pytest.mark.asyncio
+    async def test_report_service_create_emits_report_created(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from sautiris.core.events import ReportCreated
+        from sautiris.services.report_service import ReportService
+
+        bus = EventBus()
+        captured: list[DomainEvent] = []
+
+        async def capture(event: DomainEvent) -> None:
+            captured.append(event)
+
+        bus.subscribe("report.created", capture)
+
+        mock_session = AsyncMock()
+        svc = ReportService(mock_session, event_bus=bus)
+
+        import uuid as _uuid
+
+        mock_report = MagicMock()
+        mock_report.id = _uuid.uuid4()
+        mock_report.order_id = _uuid.uuid4()
+        mock_report.tenant_id = _uuid.uuid4()
+        mock_report.accession_number = "ACC-001"
+        mock_report.report_status = "DRAFT"
+        mock_report.reported_by = _uuid.uuid4()
+        mock_report.is_critical = False
+        mock_report.findings = "Normal"
+        mock_report.impression = "Normal"
+        mock_report.body = None
+
+        svc.report_repo = AsyncMock()
+        svc.report_repo.create.return_value = mock_report
+        svc.report_repo.get_next_version_number.return_value = 1
+        svc.report_repo.create_version.return_value = MagicMock()
+        svc.template_repo = AsyncMock()
+        svc.template_repo.find_default_template.return_value = None
+
+        await svc.create_report(
+            order_id=mock_report.order_id,
+            accession_number="ACC-001",
+            reported_by=mock_report.reported_by,
+            reported_by_name="Dr. Test",
+        )
+
+        assert len(captured) == 1
+        assert isinstance(captured[0], ReportCreated)
+        assert captured[0].report_id == str(mock_report.id)
+
+    @pytest.mark.asyncio
+    async def test_report_service_amend_emits_report_amended(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from sautiris.core.events import ReportAmended
+        from sautiris.services.report_service import ReportService
+
+        bus = EventBus()
+        captured: list[DomainEvent] = []
+
+        async def capture(event: DomainEvent) -> None:
+            captured.append(event)
+
+        bus.subscribe("report.amended", capture)
+
+        mock_session = AsyncMock()
+        svc = ReportService(mock_session, event_bus=bus)
+
+        import uuid as _uuid
+
+        mock_report = MagicMock()
+        mock_report.id = _uuid.uuid4()
+        mock_report.order_id = _uuid.uuid4()
+        mock_report.tenant_id = _uuid.uuid4()
+        mock_report.accession_number = "ACC-001"
+        mock_report.report_status = "FINAL"
+        mock_report.reported_by = _uuid.uuid4()
+        mock_report.is_critical = False
+        mock_report.findings = "Updated findings"
+        mock_report.impression = "Updated"
+        mock_report.body = None
+
+        svc.report_repo = AsyncMock()
+        svc.report_repo.get_by_id.return_value = mock_report
+        svc.report_repo.update.return_value = mock_report
+        svc.report_repo.get_next_version_number.return_value = 2
+        svc.report_repo.create_version.return_value = MagicMock()
+
+        changed_by = _uuid.uuid4()
+        await svc.amend_report(
+            mock_report.id,
+            changed_by=changed_by,
+            findings="Amended findings",
+        )
+
+        assert len(captured) == 1
+        assert isinstance(captured[0], ReportAmended)
+        assert captured[0].changed_by == str(changed_by)
+
+    # --- Order transition events (REPORTED, VERIFIED, DISTRIBUTED) ---
+
+    @pytest.mark.asyncio
+    async def test_order_transition_reported_emits_order_reported(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from sautiris.core.events import OrderReported
+        from sautiris.services.order_service import OrderService
+
+        bus = EventBus()
+        captured: list[DomainEvent] = []
+
+        async def capture(event: DomainEvent) -> None:
+            captured.append(event)
+
+        bus.subscribe("order.reported", capture)
+
+        mock_session = AsyncMock()
+        svc = OrderService(mock_session, event_bus=bus)
+        mock_order = MagicMock()
+        mock_order.id = __import__("uuid").uuid4()
+        mock_order.tenant_id = __import__("uuid").uuid4()
+        mock_order.status = "COMPLETED"
+        svc.repo = AsyncMock()
+        svc.repo.get_by_id.return_value = mock_order
+        svc.repo.update.return_value = mock_order
+
+        # _transition is private; we test via the public status change path
+        # Use _transition directly since no public method triggers REPORTED
+        await svc._transition(
+            mock_order,
+            __import__("sautiris.models.order", fromlist=["OrderStatus"]).OrderStatus.REPORTED,
+        )
+
+        assert len(captured) == 1
+        assert isinstance(captured[0], OrderReported)
+        assert captured[0].from_status == "COMPLETED"
+
+    @pytest.mark.asyncio
+    async def test_order_transition_verified_emits_order_verified(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from sautiris.core.events import OrderVerified
+        from sautiris.models.order import OrderStatus
+        from sautiris.services.order_service import OrderService
+
+        bus = EventBus()
+        captured: list[DomainEvent] = []
+
+        async def capture(event: DomainEvent) -> None:
+            captured.append(event)
+
+        bus.subscribe("order.verified", capture)
+
+        mock_session = AsyncMock()
+        svc = OrderService(mock_session, event_bus=bus)
+        mock_order = MagicMock()
+        mock_order.id = __import__("uuid").uuid4()
+        mock_order.tenant_id = __import__("uuid").uuid4()
+        mock_order.status = "REPORTED"
+        svc.repo = AsyncMock()
+        svc.repo.update.return_value = mock_order
+
+        await svc._transition(mock_order, OrderStatus.VERIFIED)
+
+        assert len(captured) == 1
+        assert isinstance(captured[0], OrderVerified)
+        assert captured[0].from_status == "REPORTED"
+
+    @pytest.mark.asyncio
+    async def test_order_transition_distributed_emits_order_distributed(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from sautiris.core.events import OrderDistributed
+        from sautiris.models.order import OrderStatus
+        from sautiris.services.order_service import OrderService
+
+        bus = EventBus()
+        captured: list[DomainEvent] = []
+
+        async def capture(event: DomainEvent) -> None:
+            captured.append(event)
+
+        bus.subscribe("order.distributed", capture)
+
+        mock_session = AsyncMock()
+        svc = OrderService(mock_session, event_bus=bus)
+        mock_order = MagicMock()
+        mock_order.id = __import__("uuid").uuid4()
+        mock_order.tenant_id = __import__("uuid").uuid4()
+        mock_order.status = "VERIFIED"
+        svc.repo = AsyncMock()
+        svc.repo.update.return_value = mock_order
+
+        await svc._transition(mock_order, OrderStatus.DISTRIBUTED)
+
+        assert len(captured) == 1
+        assert isinstance(captured[0], OrderDistributed)
+        assert captured[0].from_status == "VERIFIED"
+
+    # --- Worklist events ---
+
+    @pytest.mark.asyncio
+    async def test_worklist_discontinued_emits_worklist_status_changed(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from sautiris.core.events import WorklistStatusChanged
+        from sautiris.models.worklist import WorklistStatus
+        from sautiris.services.worklist_service import WorklistService
+
+        bus = EventBus()
+        captured: list[DomainEvent] = []
+
+        async def capture(event: DomainEvent) -> None:
+            captured.append(event)
+
+        bus.subscribe("worklist.status_changed", capture)
+
+        mock_session = AsyncMock()
+        svc = WorklistService(mock_session, event_bus=bus)
+        mock_item = MagicMock()
+        mock_item.id = __import__("uuid").uuid4()
+        mock_item.order_id = __import__("uuid").uuid4()
+        mock_item.tenant_id = __import__("uuid").uuid4()
+        mock_item.status = WorklistStatus.SCHEDULED
+        svc.repo = AsyncMock()
+        svc.repo.get_by_id.return_value = mock_item
+        svc.repo.update.return_value = mock_item
+
+        await svc.update_procedure_step_status(mock_item.id, WorklistStatus.DISCONTINUED)
+
+        assert len(captured) == 1
+        assert isinstance(captured[0], WorklistStatusChanged)
+        assert captured[0].to_status == str(WorklistStatus.DISCONTINUED)
+
+    @pytest.mark.asyncio
+    async def test_worklist_mpps_received_emits_typed_event(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from sautiris.core.events import WorklistMPPSReceived
+        from sautiris.models.worklist import MPPSStatus, WorklistStatus
+        from sautiris.services.worklist_service import WorklistService
+
+        bus = EventBus()
+        captured: list[DomainEvent] = []
+
+        async def capture(event: DomainEvent) -> None:
+            captured.append(event)
+
+        bus.subscribe("worklist.mpps_received", capture)
+
+        mock_session = AsyncMock()
+        svc = WorklistService(mock_session, event_bus=bus)
+        mock_item = MagicMock()
+        mock_item.id = __import__("uuid").uuid4()
+        mock_item.order_id = __import__("uuid").uuid4()
+        mock_item.tenant_id = __import__("uuid").uuid4()
+        mock_item.status = WorklistStatus.IN_PROGRESS
+        mock_item.mpps_status = None
+        mock_item.mpps_uid = None
+        svc.repo = AsyncMock()
+        svc.repo.get_by_id.return_value = mock_item
+        svc.repo.update.return_value = mock_item
+
+        await svc.receive_mpps(mock_item.id, mpps_status=MPPSStatus.COMPLETED, mpps_uid="1.2.3")
+
+        assert len(captured) == 1
+        assert isinstance(captured[0], WorklistMPPSReceived)
+        assert captured[0].mpps_status == MPPSStatus.COMPLETED
+        assert captured[0].mpps_uid == "1.2.3"
+
+    # --- Schedule events ---
+
+    @pytest.mark.asyncio
+    async def test_schedule_create_slot_emits_slot_created(self) -> None:
+        from datetime import datetime
+        from unittest.mock import AsyncMock, MagicMock
+
+        from sautiris.core.events import ScheduleSlotCreated
+        from sautiris.services.schedule_service import ScheduleService
+
+        bus = EventBus()
+        captured: list[DomainEvent] = []
+
+        async def capture(event: DomainEvent) -> None:
+            captured.append(event)
+
+        bus.subscribe("schedule.slot_created", capture)
+
+        mock_session = AsyncMock()
+        svc = ScheduleService(mock_session, event_bus=bus)
+        import uuid as _uuid
+
+        mock_slot = MagicMock()
+        mock_slot.id = _uuid.uuid4()
+        mock_slot.order_id = _uuid.uuid4()
+        mock_slot.room_id = "CT-1"
+        mock_slot.modality = "CT"
+        mock_slot.status = "AVAILABLE"
+        svc.repo = AsyncMock()
+        svc.repo.find_conflicts.return_value = []
+        svc.repo.create.return_value = mock_slot
+
+        await svc.create_slot(
+            order_id=mock_slot.order_id,
+            room_id="CT-1",
+            modality="CT",
+            scheduled_start=datetime(2026, 3, 10, 9, 0, tzinfo=UTC),
+            scheduled_end=datetime(2026, 3, 10, 9, 30, tzinfo=UTC),
+        )
+
+        assert len(captured) == 1
+        assert isinstance(captured[0], ScheduleSlotCreated)
+        assert captured[0].room_id == "CT-1"
+        assert captured[0].modality == "CT"
+
+    # ---------------------------------------------------------------------------
+    # #55: CriticalFinding handler error → CRITICAL log via EventPublisherMixin
+    # ---------------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_critical_finding_handler_error_logs_critical(self) -> None:
+        """#55: When a CriticalFinding handler raises, mixin logs at CRITICAL level.
+
+        CriticalFinding is in ReportService._critical_event_types, so failures
+        must produce a ``event_bus.critical_event_handlers_failed`` CRITICAL log
+        via the EventPublisherMixin in sautiris.services.mixins.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from sautiris.models.report import ReportStatus
+        from sautiris.services.report_service import ReportService
+
+        bus = EventBus()
+
+        async def _failing_handler(event: object) -> None:
+            raise RuntimeError("pager service down")
+
+        # CriticalFinding is published by finalize_report() when is_critical=True
+        bus.subscribe("finding.critical", _failing_handler)
+
+        mock_session = AsyncMock()
+        svc = ReportService(mock_session, event_bus=bus)
+
+        import uuid as _uuid
+
+        mock_report = MagicMock()
+        mock_report.id = _uuid.uuid4()
+        mock_report.order_id = _uuid.uuid4()
+        mock_report.tenant_id = _uuid.uuid4()
+        mock_report.accession_number = "ACC-CRIT-001"
+        mock_report.report_status = ReportStatus.PRELIMINARY
+        mock_report.reported_by = _uuid.uuid4()
+        mock_report.is_critical = True
+        mock_report.findings = "Pneumothorax"
+        mock_report.impression = "Urgent"
+        mock_report.body = None
+        mock_report.approved_by = None
+        mock_report.approved_by_name = None
+        mock_report.approved_at = None
+
+        svc.report_repo = AsyncMock()
+        svc.report_repo.get_by_id.return_value = mock_report
+        svc.report_repo.update.return_value = mock_report
+        svc.report_repo.get_next_version_number.return_value = 2
+        svc.report_repo.create_version.return_value = MagicMock()
+
+        approved_by = _uuid.uuid4()
+
+        # _publish logs from sautiris.services.mixins.logger
+        with patch("sautiris.services.mixins.logger") as mock_logger:
+            await svc.finalize_report(
+                mock_report.id,
+                approved_by=approved_by,
+                approved_by_name="Dr. Approver",
+            )
+            # Handler error is logged at ERROR level
+            mock_logger.error.assert_called()
+            error_key = mock_logger.error.call_args_list[0][0][0]
+            assert "event_bus.handler_error" in error_key
+
+            # CriticalFinding is a _critical_event_type — additional CRITICAL log
+            mock_logger.critical.assert_called()
+            critical_key = mock_logger.critical.call_args[0][0]
+            assert "critical_event_handlers_failed" in critical_key
+
+    @pytest.mark.asyncio
+    async def test_schedule_update_slot_emits_slot_updated(self) -> None:
+        from datetime import datetime
+        from unittest.mock import AsyncMock, MagicMock
+
+        from sautiris.core.events import ScheduleSlotUpdated
+        from sautiris.services.schedule_service import ScheduleService
+
+        bus = EventBus()
+        captured: list[DomainEvent] = []
+
+        async def capture(event: DomainEvent) -> None:
+            captured.append(event)
+
+        bus.subscribe("schedule.slot_updated", capture)
+
+        mock_session = AsyncMock()
+        svc = ScheduleService(mock_session, event_bus=bus)
+        import uuid as _uuid
+
+        mock_slot = MagicMock()
+        mock_slot.id = _uuid.uuid4()
+        mock_slot.order_id = _uuid.uuid4()
+        mock_slot.room_id = "CT-2"
+        mock_slot.modality = "CT"
+        mock_slot.status = "BOOKED"
+        mock_slot.scheduled_start = datetime(2026, 3, 10, 9, 0, tzinfo=UTC)
+        mock_slot.scheduled_end = datetime(2026, 3, 10, 9, 30, tzinfo=UTC)
+        mock_slot.technologist_id = None
+        svc.repo = AsyncMock()
+        svc.repo.get_by_id.return_value = mock_slot
+        svc.repo.find_conflicts.return_value = []
+        svc.repo.update.return_value = mock_slot
+
+        await svc.update_slot(mock_slot.id, notes="Updated notes")
+
+        assert len(captured) == 1
+        assert isinstance(captured[0], ScheduleSlotUpdated)
+        assert captured[0].room_id == "CT-2"

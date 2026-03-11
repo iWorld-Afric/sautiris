@@ -49,3 +49,156 @@ class TestCLI:
         assert result.exit_code == 0
         assert "--port" in result.output
         assert "--ae-title" in result.output
+
+    def test_rotate_key_help(self) -> None:
+        runner = CliRunner()
+        result = runner.invoke(main, ["security", "rotate-key", "--help"])
+        assert result.exit_code == 0
+        assert "--old-key" in result.output
+        assert "--new-key" in result.output
+        assert "--database-url" in result.output
+
+    def test_rotate_key_happy_path(self) -> None:
+        """#56: rotate-key with valid Fernet keys and mocked DB rotates successfully.
+
+        Verifies the full success path:
+        - Key validation passes (valid Fernet keys)
+        - DB rotation is invoked and returns a result
+        - Output confirms the rotated count
+        - Exit code is 0
+        """
+        from unittest.mock import MagicMock, patch
+
+        from cryptography.fernet import Fernet
+
+        old_key = Fernet.generate_key().decode()
+        new_key = Fernet.generate_key().decode()
+
+        mock_result = MagicMock()
+        mock_result.rotated_count = 3
+        mock_result.skipped_count = 0
+
+        runner = CliRunner()
+        with (
+            patch("sqlalchemy.create_engine") as mock_create_engine,
+            patch(
+                "sautiris.core.crypto.rotate_encryption_key_detailed",
+                return_value=mock_result,
+            ),
+        ):
+            # Mock the engine context manager
+            mock_conn = MagicMock()
+            mock_ctx_mgr = MagicMock()
+            mock_ctx_mgr.__enter__ = MagicMock(return_value=mock_conn)
+            mock_ctx_mgr.__exit__ = MagicMock(return_value=False)
+            mock_engine = MagicMock()
+            mock_engine.begin.return_value = mock_ctx_mgr
+            mock_create_engine.return_value = mock_engine
+
+            result = runner.invoke(
+                main,
+                ["security", "rotate-key"],
+                env={
+                    "SAUTIRIS_OLD_ENCRYPTION_KEY": old_key,
+                    "SAUTIRIS_NEW_ENCRYPTION_KEY": new_key,
+                    "SAUTIRIS_DATABASE_URL": "postgresql://localhost/ris",
+                },
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "3 value(s) re-encrypted" in result.output
+        assert "Update SAUTIRIS_ENCRYPTION_KEY" in result.output
+
+    def test_apikey_create_success(self) -> None:
+        """apikey create with mocked DB inserts a key and prints it."""
+        from unittest.mock import MagicMock, patch
+
+        runner = CliRunner()
+        mock_conn = MagicMock()
+        mock_ctx = MagicMock()
+        mock_ctx.__enter__ = MagicMock(return_value=mock_conn)
+        mock_ctx.__exit__ = MagicMock(return_value=False)
+        mock_engine = MagicMock()
+        mock_engine.begin.return_value = mock_ctx
+
+        with patch("sqlalchemy.create_engine", return_value=mock_engine):
+            result = runner.invoke(
+                main,
+                [
+                    "apikey",
+                    "create",
+                    "--name",
+                    "test-key",
+                    "--user-id",
+                    "11111111-1111-1111-1111-111111111111",
+                    "--tenant-id",
+                    "00000000-0000-0000-0000-000000000001",
+                    "--scopes",
+                    "orders:read,reports:write",
+                    "--database-url",
+                    "postgresql+psycopg2://localhost/ris",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "API key created successfully" in result.output
+        assert "sautiris_" in result.output  # Key uses correct prefix
+        assert "orders:read" in result.output
+        mock_conn.execute.assert_called_once()
+
+    def test_audit_export_json(self) -> None:
+        """audit export with mocked DB outputs JSON records."""
+        from unittest.mock import MagicMock, patch
+
+        runner = CliRunner()
+        mock_conn = MagicMock()
+        mock_result = MagicMock()
+        mock_result.keys.return_value = ["id", "action", "created_at"]
+        mock_result.fetchall.return_value = []
+        mock_conn.execute.return_value = mock_result
+
+        mock_connect_ctx = MagicMock()
+        mock_connect_ctx.__enter__ = MagicMock(return_value=mock_conn)
+        mock_connect_ctx.__exit__ = MagicMock(return_value=False)
+        mock_engine = MagicMock()
+        mock_engine.connect.return_value = mock_connect_ctx
+
+        with patch("sqlalchemy.create_engine", return_value=mock_engine):
+            result = runner.invoke(
+                main,
+                [
+                    "audit",
+                    "export",
+                    "--format",
+                    "json",
+                    "--database-url",
+                    "postgresql+psycopg2://localhost/ris",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "Exported 0 audit record(s) as JSON" in result.output
+
+    def test_rotate_key_reads_keys_from_envvars(self) -> None:
+        """rotate-key accepts --old-key and --new-key via environment variables."""
+        from cryptography.fernet import Fernet
+
+        old_key = Fernet.generate_key().decode()
+        new_key = Fernet.generate_key().decode()
+        runner = CliRunner()
+        # Pass keys via envvar only (no --old-key / --new-key flags).
+        # Without a database URL the command will fail at DB connect, but we
+        # verify the key validation step succeeds (no "Missing option" error).
+        result = runner.invoke(
+            main,
+            ["security", "rotate-key"],
+            env={
+                "SAUTIRIS_OLD_ENCRYPTION_KEY": old_key,
+                "SAUTIRIS_NEW_ENCRYPTION_KEY": new_key,
+                "SAUTIRIS_DATABASE_URL": "sqlite:///nonexistent.db",
+            },
+        )
+        # Should NOT fail with "Missing option --old-key" or "--new-key"
+        assert "Missing option" not in (result.output or "")
+        assert "--old-key" not in (result.output or "")
+        assert "--new-key" not in (result.output or "")

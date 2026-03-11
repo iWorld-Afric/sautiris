@@ -49,3 +49,7 @@ class CriticalAlert(TenantAwareBase):
     acknowledged_by: Mapped[uuid.UUID | None] = mapped_column(default=None)
     escalated: Mapped[bool] = mapped_column(Boolean, default=False)
     escalated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    # Notification failure tracking (#42): set when dispatch fails so the
+    # auto-escalation worker can retry (#44) and operators can identify stuck alerts.
+    notification_failed: Mapped[bool] = mapped_column(Boolean, default=False)
+    notification_error: Mapped[str | None] = mapped_column(Text, default=None)

@@ -12,12 +12,16 @@ Key generation:
 from __future__ import annotations
 
 import os
-from typing import Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from cryptography.fernet import InvalidToken
 from sqlalchemy import String
 from sqlalchemy.types import TypeDecorator
+
+if TYPE_CHECKING:
+    from sqlalchemy.engine import Connection
 
 logger = structlog.get_logger(__name__)
 
@@ -76,7 +80,7 @@ class EncryptedString(TypeDecorator[str]):
         try:
             return _fernet_decrypt(value, key)
         except InvalidToken:
-            if value.startswith("gAAAAA"):
+            if value.startswith(_FERNET_PREFIX):
                 # Value is a Fernet token — decryption failed (wrong key or data corruption).
                 # Returning ciphertext as plaintext would silently corrupt data; raise instead.
                 logger.critical(
@@ -99,3 +103,98 @@ class EncryptedString(TypeDecorator[str]):
                 ),
             )
             return value
+
+
+# #7: Unified Fernet prefix — all Fernet-encrypted values start with "gAAAAAB"
+_FERNET_PREFIX = "gAAAAAB"
+
+# #38: Use tuple[tuple[str, tuple[str, ...]], ...] for full immutability
+_ENCRYPTED_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("pacs_connections", ("password",)),
+    ("ai_provider_configs", ("api_key", "webhook_secret")),
+)
+
+
+# #37: Frozen dataclass with slots — immutable result type
+@dataclass(frozen=True, slots=True)
+class KeyRotationResult:
+    """Result of a key rotation operation."""
+
+    rotated_count: int
+    skipped_count: int
+
+
+def rotate_encryption_key_detailed(
+    conn: Connection,
+    old_key: str,
+    new_key: str,
+) -> KeyRotationResult:
+    """Re-encrypt all credential columns from *old_key* to *new_key*.
+
+    Operates within the caller's transaction — the caller is responsible
+    for committing or rolling back.
+
+    Returns a ``KeyRotationResult`` with both rotated and skipped counts.
+    Logs a WARNING for each skipped plaintext value and raises
+    ``DecryptionError`` with context if decryption fails on a Fernet token.
+    """
+    from cryptography.fernet import Fernet  # noqa: PLC0415
+    from sqlalchemy import text  # noqa: PLC0415
+    from sqlalchemy.sql import quoted_name  # noqa: PLC0415
+
+    old_fernet = Fernet(old_key.encode())
+    new_fernet = Fernet(new_key.encode())
+    rotated = 0
+    skipped = 0
+
+    for table, columns in _ENCRYPTED_COLUMNS:
+        # #77: Use quoted_name() for SQL identifiers to prevent SQL injection
+        # instead of raw string interpolation with noqa suppression.
+        quoted_table = str(quoted_name(table, quote=True))
+        quoted_cols = ", ".join(
+            [str(quoted_name("id", quote=True))]
+            + [str(quoted_name(c, quote=True)) for c in columns]
+        )
+        rows = conn.execute(text(f"SELECT {quoted_cols} FROM {quoted_table}")).fetchall()
+        for row in rows:
+            row_id = row[0]
+            updates: dict[str, str] = {}
+            for i, col in enumerate(columns, start=1):
+                value = row[i]
+                if not value:
+                    continue
+                str_value = str(value)
+                if not str_value.startswith(_FERNET_PREFIX):
+                    skipped += 1
+                    logger.warning(
+                        "crypto.key_rotation_skipped_plaintext",
+                        table=table,
+                        column=col,
+                        row_id=str(row_id),
+                        msg="Value is not Fernet-encrypted — skipping rotation",
+                    )
+                    continue
+                try:
+                    plaintext = old_fernet.decrypt(str_value.encode()).decode()
+                except InvalidToken:
+                    raise DecryptionError(
+                        f"Failed to decrypt {table}.{col} (row {row_id}) "
+                        f"with the old key — wrong key or corrupted ciphertext"
+                    ) from None
+                updates[col] = new_fernet.encrypt(plaintext.encode()).decode()
+            if updates:
+                rotated += len(updates)
+                quoted_t = str(quoted_name(table, quote=True))
+                set_clause = ", ".join(f"{quoted_name(k, quote=True)} = :{k}" for k in updates)
+                updates["id"] = str(row_id)
+                conn.execute(
+                    text(f"UPDATE {quoted_t} SET {set_clause} WHERE id = :id"),
+                    updates,
+                )
+
+    logger.info(
+        "crypto.key_rotation_complete",
+        rotated_values=rotated,
+        skipped_plaintext=skipped,
+    )
+    return KeyRotationResult(rotated_count=rotated, skipped_count=skipped)

@@ -159,53 +159,69 @@ class DicomAssociationSecurity:
                 calling_ae=calling_ae,
                 ip=ip,
             )
-            raise RuntimeError(f"AE title '{calling_ae}' not in whitelist")
+            raise RuntimeError("Association rejected")
 
         if not self.check_rate_limit(ip):
             logger.warning("dicom.security.rate_limit_exceeded", ip=ip)
-            raise RuntimeError(f"Rate limit exceeded for {ip}")
+            raise RuntimeError("Association rejected")
 
         if not self.acquire_connection(ip):
             logger.warning("dicom.security.connection_limit_exceeded", ip=ip)
-            raise RuntimeError(f"Connection limit exceeded for {ip}")
+            raise RuntimeError("Association rejected")
 
         logger.info("dicom.security.association_accepted", calling_ae=calling_ae, ip=ip)
 
-    def handle_association_released(self, event: Event) -> None:
-        """EVT_RELEASED handler — release a connection slot."""
+    def _handle_association_end(self, event: Event, event_name: str) -> None:
+        """Shared teardown logic for EVT_RELEASED and EVT_ABORTED handlers.
+
+        Releases the connection slot and logs the event.  Both
+        handle_association_released and handle_association_aborted delegate
+        here (#33: avoids duplicating the same extraction + release logic).
+
+        Args:
+            event: The pynetdicom event object.
+            event_name: Human-readable label for logging (``"released"`` or
+                ``"aborted"``).
+        """
         ip = ""
         calling_ae = "unknown"
         try:
             ip = str(event.assoc.requestor.address)
             calling_ae = str(event.assoc.requestor.ae_title).strip()
         except Exception:
-            logger.error("dicom.security.release_ip_extraction_failed", exc_info=True)
+            logger.error(
+                f"dicom.security.{event_name}_ip_extraction_failed",
+                exc_info=True,
+            )
         if ip:
             self.release_connection(ip)
         else:
             logger.error(
                 "dicom.security.connection_slot_leaked",
-                msg="Could not release connection slot — IP address unknown",
+                event=event_name,
+                msg=f"Could not release connection slot on {event_name} — IP address unknown",
             )
-        logger.info("dicom.security.association_released", calling_ae=calling_ae, ip=ip)
+        logger.info(
+            f"dicom.security.association_{event_name}",
+            calling_ae=calling_ae,
+            ip=ip,
+        )
+
+    def handle_association_released(self, event: Event) -> None:
+        """EVT_RELEASED handler — release a connection slot.
+
+        Thin wrapper around _handle_association_end (#33).
+        pynetdicom requires separate callables for EVT_RELEASED and EVT_ABORTED.
+        """
+        self._handle_association_end(event, "released")
 
     def handle_association_aborted(self, event: Event) -> None:
-        """EVT_ABORTED handler — release a connection slot on abort."""
-        ip = ""
-        calling_ae = "unknown"
-        try:
-            ip = str(event.assoc.requestor.address)
-            calling_ae = str(event.assoc.requestor.ae_title).strip()
-        except Exception:
-            logger.error("dicom.security.abort_ip_extraction_failed", exc_info=True)
-        if ip:
-            self.release_connection(ip)
-        else:
-            logger.error(
-                "dicom.security.connection_slot_leaked",
-                msg="Could not release connection slot on abort — IP address unknown",
-            )
-        logger.info("dicom.security.association_aborted", calling_ae=calling_ae, ip=ip)
+        """EVT_ABORTED handler — release a connection slot on abort.
+
+        Thin wrapper around _handle_association_end (#33).
+        pynetdicom requires separate callables for EVT_RELEASED and EVT_ABORTED.
+        """
+        self._handle_association_end(event, "aborted")
 
     @property
     def active_connections(self) -> dict[str, int]:

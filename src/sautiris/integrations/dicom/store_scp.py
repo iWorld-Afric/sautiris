@@ -8,31 +8,28 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import io
+import json
+import os
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
 
 import structlog
-from pynetdicom import AE, evt
+from pynetdicom import AE, evt  # AE imported here so tests can patch this module's AE
+
+from sautiris.integrations.dicom.base_scp import BaseSCPServer
+from sautiris.integrations.dicom.constants import DEFAULT_TRANSFER_SYNTAXES, DicomHandlerList
+
+# Re-exported for backwards compatibility with existing imports.
+# #29: new code should import DEFAULT_TRANSFER_SYNTAXES from constants directly.
+TRANSFER_SYNTAXES = DEFAULT_TRANSFER_SYNTAXES
 
 if TYPE_CHECKING:
     from pynetdicom.events import Event
 
+    from sautiris.integrations.dicom.security import DicomAssociationSecurity  # noqa: F401
+
 logger = structlog.get_logger(__name__)
-
-# SpecificCharacterSet for UTF-8 (ISO_IR 192) — Issue #5
-CHARSET_UTF8 = "ISO_IR 192"
-
-# Transfer syntaxes supported by this SCP — Issue #9
-TRANSFER_SYNTAXES: list[str] = [
-    "1.2.840.10008.1.2.1",    # Explicit VR Little Endian
-    "1.2.840.10008.1.2",      # Implicit VR Little Endian
-    "1.2.840.10008.1.2.4.50", # JPEG Baseline (Process 1)
-    "1.2.840.10008.1.2.4.70", # JPEG Lossless (Process 14 SV1)
-    "1.2.840.10008.1.2.4.90", # JPEG 2000 Lossless Only
-    "1.2.840.10008.1.2.4.91", # JPEG 2000
-    "1.2.840.10008.1.2.5",    # RLE Lossless
-    "1.2.840.10008.1.2.1.99", # Deflated Explicit VR Little Endian
-]
 
 # ---------------------------------------------------------------------------
 # Storage SOP Class UIDs — Issue #7: expanded to 25+ classes
@@ -63,14 +60,15 @@ ENHANCED_XA_STORAGE = "1.2.840.10008.5.1.4.1.1.12.1.1"
 RF_IMAGE_STORAGE = "1.2.840.10008.5.1.4.1.1.12.2"
 
 # Structured Reporting
-RDSR_STORAGE = "1.2.840.10008.5.1.4.1.1.88.67"           # Radiation Dose SR
-ENHANCED_SR_STORAGE = "1.2.840.10008.5.1.4.1.1.88.22"    # Enhanced SR
+BASIC_SR_STORAGE = "1.2.840.10008.5.1.4.1.1.88.11"   # Basic Text SR
+RDSR_STORAGE = "1.2.840.10008.5.1.4.1.1.88.67"        # Radiation Dose SR
+ENHANCED_SR_STORAGE = "1.2.840.10008.5.1.4.1.1.88.22" # Enhanced SR
 COMPREHENSIVE_SR_STORAGE = "1.2.840.10008.5.1.4.1.1.88.33"  # Comprehensive SR
-KEY_OBJECT_SELECTION = "1.2.840.10008.5.1.4.1.1.88.59"    # Key Object Selection
+KEY_OBJECT_SELECTION = "1.2.840.10008.5.1.4.1.1.88.59"  # Key Object Selection
 
 # Documents / Presentation
 ENCAPSULATED_PDF = "1.2.840.10008.5.1.4.1.1.104.1"
-GRAYSCALE_SOFTCOPY_PS = "1.2.840.10008.5.1.4.1.1.11.1"   # Grayscale Softcopy PS
+GRAYSCALE_SOFTCOPY_PS = "1.2.840.10008.5.1.4.1.1.11.1"  # Grayscale Softcopy PS
 
 # Radiotherapy
 RT_IMAGE_STORAGE = "1.2.840.10008.5.1.4.1.1.481.1"
@@ -112,6 +110,7 @@ DEFAULT_STORAGE_SOP_CLASSES: list[str] = [
     ENHANCED_XA_STORAGE,
     RF_IMAGE_STORAGE,
     # Structured Reporting (RDSR routes to dose pipeline)
+    BASIC_SR_STORAGE,
     RDSR_STORAGE,
     ENHANCED_SR_STORAGE,
     COMPREHENSIVE_SR_STORAGE,
@@ -153,7 +152,7 @@ def is_rdsr(sop_class_uid: str) -> bool:
     return sop_class_uid == RDSR_STORAGE
 
 
-class StoreSCPServer:
+class StoreSCPServer(BaseSCPServer):
     """C-STORE SCP receiver.
 
     Accepts incoming DICOM instances and invokes a callback for each
@@ -171,37 +170,143 @@ class StoreSCPServer:
         loop: The asyncio event loop to run async callbacks on.
         storage_sop_classes: List of Storage SOP Class UIDs to accept.
         bind_address: IP address to bind to (default ``"127.0.0.1"``).
+        security: Optional DicomAssociationSecurity for AE whitelist/rate/connection limits.
+        tls_cert: Path to TLS certificate file.  Empty string disables TLS.
+        tls_key: Path to TLS private key file.  Empty string disables TLS.
+        tls_ca_cert: Path to CA certificate for mutual TLS.  Empty string
+            disables client verification.
+        dead_letter_dir: Optional directory path for persisting failed RDSR datasets
+            and timed-out store operations.  When provided, datasets that cannot be
+            processed are written here for later reprocessing (#16).
     """
 
     def __init__(
         self,
         ae_title: str = "SAUTIRIS_STORE",
         port: int = 11114,
-        store_callback: Callable[[bytes, dict[str, str]], Coroutine[Any, Any, None]] | None = None,
-        rdsr_callback: Callable[[Any, dict[str, str]], Coroutine[Any, Any, None]] | None = None,
+        store_callback: (
+            Callable[[bytes, dict[str, str]], Coroutine[Any, Any, None]] | None
+        ) = None,
+        rdsr_callback: (Callable[[Any, dict[str, str]], Coroutine[Any, Any, None]] | None) = None,
         loop: asyncio.AbstractEventLoop | None = None,
         storage_sop_classes: list[str] | None = None,
         bind_address: str = "127.0.0.1",
+        security: DicomAssociationSecurity | None = None,
+        tls_cert: str = "",
+        tls_key: str = "",
+        tls_ca_cert: str = "",
+        dead_letter_dir: str | None = None,
     ) -> None:
-        self.ae_title = ae_title
-        self.port = port
+        super().__init__(
+            ae_title=ae_title,
+            port=port,
+            loop=loop,
+            bind_address=bind_address,
+            security=security,
+            tls_cert=tls_cert,
+            tls_key=tls_key,
+            tls_ca_cert=tls_ca_cert,
+        )
         self._store_callback = store_callback
         self._rdsr_callback = rdsr_callback
-        self._loop = loop
         self._storage_sop_classes = storage_sop_classes or DEFAULT_STORAGE_SOP_CLASSES
-        self._bind_address = bind_address
-        self._ae: AE | None = None
+        self._dead_letter_dir = dead_letter_dir
+        self._ae = None
         self._received_count: int = 0
+
+    # ------------------------------------------------------------------
+    # BaseSCPServer interface
+    # ------------------------------------------------------------------
+
+    def _make_ae(self) -> AE:
+        """Use this module's AE so that ``patch('...store_scp.AE')`` works in tests."""
+        return AE(ae_title=self.ae_title)
+
+    def _get_sop_classes_and_handlers(self) -> tuple[list[str], DicomHandlerList]:
+        return self._storage_sop_classes, [(evt.EVT_C_STORE, self._handle_store)]
+
+    def _log_started(self, tls_enabled: bool) -> None:
+        logger.info(
+            "store_scp.server_started",
+            ae_title=self.ae_title,
+            port=self.port,
+            sop_classes=len(self._storage_sop_classes),
+            tls_enabled=tls_enabled,
+        )
+
+    # ------------------------------------------------------------------
+    # Dead-letter helpers
+    # ------------------------------------------------------------------
+
+    def _persist_dead_letter(self, dataset: Any, metadata: dict[str, str], reason: str) -> None:
+        """Persist a dataset to the dead-letter directory if configured.
+
+        Args:
+            dataset: The pydicom Dataset to persist.
+            metadata: Metadata dict from :func:`extract_store_metadata`.
+            reason: Short label for why the dataset is being dead-lettered
+                (e.g. ``"rdsr_callback_failed"`` or ``"store_timeout"``).
+        """
+        sop_uid = metadata.get("sop_instance_uid", "unknown")
+        if not self._dead_letter_dir:
+            return
+        try:
+            os.makedirs(self._dead_letter_dir, exist_ok=True)
+            safe_uid = sop_uid.replace(".", "_")
+            dcm_path = os.path.join(self._dead_letter_dir, f"{safe_uid}__{reason}.dcm")
+            meta_path = os.path.join(self._dead_letter_dir, f"{safe_uid}__{reason}.json")
+            buf = io.BytesIO()
+            dataset.save_as(buf, write_like_original=False)
+            with open(dcm_path, "wb") as fh:
+                fh.write(buf.getvalue())
+            with open(meta_path, "w", encoding="utf-8") as fh:
+                json.dump({**metadata, "reason": reason}, fh)
+            logger.info(
+                "store_scp.dead_letter_written",
+                path=dcm_path,
+                sop_instance_uid=sop_uid,
+                reason=reason,
+            )
+        except Exception:
+            logger.exception(
+                "store_scp.dead_letter_write_failed",
+                sop_instance_uid=sop_uid,
+                reason=reason,
+            )
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
 
     @property
     def received_count(self) -> int:
         """Number of instances received since server started."""
         return self._received_count
 
+    # ------------------------------------------------------------------
+    # C-STORE handler
+    # ------------------------------------------------------------------
+
     def _handle_store(self, event: Event) -> int:
         """Handle a C-STORE request from a modality."""
         dataset = event.dataset
         dataset.file_meta = event.file_meta
+
+        # #23: verify SpecificCharacterSet on incoming datasets
+        charset = getattr(dataset, "SpecificCharacterSet", None)
+        sop_uid_for_log = str(getattr(dataset, "SOPInstanceUID", ""))
+        if charset is None:
+            logger.warning(
+                "dicom.missing_charset",
+                sop_instance_uid=sop_uid_for_log,
+                msg="Incoming dataset has no SpecificCharacterSet tag",
+            )
+        else:
+            logger.info(
+                "dicom.incoming_charset",
+                sop_instance_uid=sop_uid_for_log,
+                charset=str(charset),
+            )
 
         metadata = extract_store_metadata(dataset)
         self._received_count += 1
@@ -214,10 +319,14 @@ class StoreSCPServer:
             count=self._received_count,
         )
 
-        # Issue #7 — route RDSR to dose extraction pipeline (fire-and-forget;
-        # blocking 30 s here would stall the pynetdicom thread pool under load).
+        # Issue #7 — route RDSR to dose extraction pipeline.
+        # Fire-and-forget: blocking 30 s here would stall the pynetdicom thread
+        # pool under load.  Failures are dead-lettered for manual reprocessing (#16).
         if is_rdsr(metadata["sop_class_uid"]) and self._rdsr_callback and self._loop:
             sop_uid = metadata["sop_instance_uid"]
+            # Capture dataset reference and dead_letter_dir for the closure
+            _dataset_snapshot = dataset
+            _dead_letter_dir = self._dead_letter_dir
             rdsr_future = asyncio.run_coroutine_threadsafe(
                 self._rdsr_callback(dataset, metadata), self._loop
             )
@@ -225,22 +334,33 @@ class StoreSCPServer:
             def _log_rdsr_error(f: concurrent.futures.Future[None]) -> None:
                 exc = f.exception()
                 if exc is not None:
-                    # Log with full identifiers so operators can manually reprocess.
-                    # TODO: Future enhancement — persist failed RDSRs to a dead-letter
-                    # queue for automatic reprocessing.
+                    if _dead_letter_dir:
+                        # #16: persist RDSR to dead-letter dir for reprocessing
+                        self._persist_dead_letter(
+                            _dataset_snapshot, metadata, "rdsr_callback_failed"
+                        )
+                    # #16: RDSR dose data loss is a CRITICAL operational event.
+                    # Log at ERROR level so that existing structured-log monitors
+                    # (and pre-existing tests) capture the event; include a
+                    # severity field to flag it for CRITICAL alerting pipelines.
                     logger.error(
                         "store_scp.rdsr_callback_error",
                         sop_instance_uid=sop_uid,
                         study_instance_uid=metadata.get("study_instance_uid", ""),
                         error=str(exc),
-                        msg="RDSR dose data may be lost — manual reprocessing required",
+                        severity="CRITICAL",
+                        dead_letter_persisted=_dead_letter_dir is not None,
+                        msg=(
+                            "RDSR dose data lost — persisted to dead-letter dir"
+                            if _dead_letter_dir
+                            else "RDSR dose data lost — no dead-letter dir configured,"
+                            " manual reprocessing required"
+                        ),
                     )
 
             rdsr_future.add_done_callback(_log_rdsr_error)
 
         if self._store_callback and self._loop:
-            import io
-
             buffer = io.BytesIO()
             dataset.save_as(buffer, write_like_original=False)
             dicom_bytes = buffer.getvalue()
@@ -266,11 +386,24 @@ class StoreSCPServer:
             try:
                 future.result(timeout=5.0)  # Reduced from 30 s to bound thread time
             except concurrent.futures.TimeoutError:
-                logger.warning(
+                # #17: Upgrade to error-level; returning SUCCESS here is a deliberate
+                # trade-off: the callback is still in-flight and may succeed, so
+                # returning a failure status could cause the modality to resend the
+                # same instance, risking duplicates.  The deferred error callback
+                # above will log any actual failure.
+                logger.error(
                     "dicom.store_callback_timeout",
                     sop_instance_uid=metadata["sop_instance_uid"],
-                    msg="Store callback still running — returning success",
+                    msg=(
+                        "Store callback timed out after 5 s — returning SUCCESS to avoid "
+                        "modality retries that could cause duplicate instances; "
+                        "callback is still running and may complete successfully"
+                    ),
                 )
+                # #17: also dead-letter the raw dataset on timeout so it can be
+                # replayed if the in-flight callback ultimately fails.
+                if self._dead_letter_dir:
+                    self._persist_dead_letter(dataset, metadata, "store_timeout")
                 return 0x0000  # image received, callback in-flight
             except Exception:
                 logger.exception(
@@ -281,33 +414,14 @@ class StoreSCPServer:
 
         return 0x0000  # Success
 
-    def start(self) -> None:
-        """Start the C-STORE SCP in non-blocking mode."""
-        self._ae = AE(ae_title=self.ae_title)
-
-        # Issue #9 — register all SOP classes with all 8 transfer syntaxes
-        for sop_class in self._storage_sop_classes:
-            self._ae.add_supported_context(sop_class, TRANSFER_SYNTAXES)
-
-        handlers = [(evt.EVT_C_STORE, self._handle_store)]
-        self._ae.start_server(
-            (self._bind_address, self.port),
-            block=False,
-            evt_handlers=handlers,  # type: ignore[arg-type]
-        )
-        logger.info(
-            "store_scp.server_started",
-            ae_title=self.ae_title,
-            port=self.port,
-            sop_classes=len(self._storage_sop_classes),
-        )
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def stop(self) -> None:
         """Stop the C-STORE SCP."""
-        if self._ae:
-            self._ae.shutdown()
-            self._ae = None
-            logger.info(
-                "store_scp.server_stopped",
-                total_received=self._received_count,
-            )
+        super().stop()
+        logger.info(
+            "store_scp.server_stopped",
+            total_received=self._received_count,
+        )

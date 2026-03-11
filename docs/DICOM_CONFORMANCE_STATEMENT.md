@@ -30,6 +30,19 @@ modality vendors who wish to integrate with SautiRIS.
 
 ## 2. Implementation Information
 
+### 2.1 Manufacturer Identification
+
+| Parameter                | Value                                               |
+|--------------------------|-----------------------------------------------------|
+| **Manufacturer**         | iWorld-Afric                                        |
+| **Product Name**         | SautiRIS                                            |
+| **Product Version**      | 1.0.0                                               |
+| **License**              | Open-source (see repository LICENSE file)           |
+| **Source Repository**    | https://github.com/iWorld-Afric/sautiris            |
+| **Issue Tracker / Contact** | https://github.com/iWorld-Afric/sautiris/issues |
+
+### 2.2 DICOM Implementation Parameters
+
 | Parameter          | Value                           |
 |--------------------|---------------------------------|
 | Implementation UID | `1.2.826.0.1.3680043.9.7539.1` |
@@ -138,7 +151,7 @@ with universal matching semantics (empty value = match all):
 | Attribute                          | Tag        | Match Type       |
 |------------------------------------|------------|------------------|
 | PatientID                          | (0010,0020)| Universal / Exact|
-| PatientName                        | (0010,0010)| Universal / Exact|
+| PatientName                        | (0010,0010)| Universal / Exact / Wildcard (*,?)|
 | AccessionNumber                    | (0008,0050)| Universal / Exact|
 | RequestedProcedureID               | (0040,1001)| Universal / Exact|
 | Modality                           | (0008,0060)| Universal / Exact|
@@ -160,6 +173,8 @@ Each response dataset includes the following attributes (DICOM PS3.4 Annex K):
 **Type 2 (Required, may be empty):**
 - PatientName, PatientID, PatientBirthDate, PatientSex
 - PatientWeight, MedicalAlerts, Allergies, PregnancyStatus
+- IssuerOfPatientID (0010,0021), AdmissionID (0038,0010)
+- ReferencedPatientSequence (0008,1120)
 - AccessionNumber, ReferringPhysicianName
 - RequestedProcedureID, RequestedProcedureDescription
 - RequestedProcedurePriority
@@ -170,6 +185,8 @@ Each response dataset includes the following attributes (DICOM PS3.4 Annex K):
   - ScheduledProcedureStepStartDate/Time
   - ScheduledProcedureStepID, ScheduledProcedureStepDescription
   - ScheduledProcedureStepStatus
+  - ScheduledPerformingPhysicianName
+  - ScheduledProtocolCodeSequence (0040,0008)
 
 **SpecificCharacterSet**: `ISO_IR 192` (UTF-8) is set on all outbound datasets.
 
@@ -201,9 +218,23 @@ Same 8 transfer syntaxes as MWL SCP (see Section 5.1.2).
 Constraints:
   - N-CREATE MUST set PerformedProcedureStepStatus = "IN PROGRESS"
     (any other value → 0x0110 Attribute Value Out of Range)
-  - Duplicate N-CREATE for existing SOP Instance UID → 0x0110
+  - Duplicate N-CREATE for existing SOP Instance UID → 0x0111
   - N-SET from terminal state → 0x0110
   - N-SET with target status other than COMPLETED/DISCONTINUED → 0x0110
+
+Type 1 Attribute Validation (PS3.4 F.7.2):
+  - N-CREATE requires: PerformedProcedureStepID, PerformedStationAETitle,
+    PerformedProcedureStepStartDate, PerformedProcedureStepStartTime
+  - N-SET to COMPLETED requires: PerformedProcedureStepEndDate,
+    PerformedProcedureStepEndTime
+  - N-SET to DISCONTINUED requires: PerformedProcedureStepEndDate,
+    PerformedProcedureStepEndTime, PerformedProcedureStepDiscontinuationReasonCodeSequence
+  - Missing required attributes → 0x0110
+
+Persistence:
+  - MPPS instances are tracked in-memory for fast state lookups
+  - DB persistence via callback (mpps_instances table)
+  - On restart, active instances can be preloaded via preload_active_instances()
 ```
 
 MPPS instances are persisted to the `mpps_instances` table (PostgreSQL).
@@ -234,6 +265,7 @@ MPPS instances are persisted to the `mpps_instances` table (PostgreSQL).
 | X-Ray Angiographic Image Storage            | `1.2.840.10008.5.1.4.1.1.12.1`   |
 | Enhanced X-Ray Angiographic Image Storage   | `1.2.840.10008.5.1.4.1.1.12.1.1` |
 | X-Ray RF Image Storage                      | `1.2.840.10008.5.1.4.1.1.12.2`   |
+| Basic Text SR Storage                       | `1.2.840.10008.5.1.4.1.1.88.11`  |
 | Radiation Dose SR Storage (RDSR)            | `1.2.840.10008.5.1.4.1.1.88.67`  |
 | Enhanced SR Storage                         | `1.2.840.10008.5.1.4.1.1.88.22`  |
 | Comprehensive SR Storage                    | `1.2.840.10008.5.1.4.1.1.88.33`  |
@@ -301,9 +333,54 @@ service provider per PS3.8.
 
 ---
 
-## 8. Limitations and Notes
+## 8. Multi-Tenancy Considerations
 
-1. **MWL Fuzzy Matching**: Not supported. Only universal (empty=all) and exact matching.
+SautiRIS is designed as a multi-tenant RIS.  The following considerations
+apply to DICOM operations in a multi-tenant deployment.
+
+### 8.1 Tenant Isolation
+
+Each tenant's worklist items, MPPS instances, and stored DICOM metadata are
+stored in separate database rows tagged with a `tenant_id` column.  No
+cross-tenant data leakage occurs at the application layer; queries are always
+filtered by the active tenant context.
+
+### 8.2 AE Title per Tenant
+
+SautiRIS supports per-tenant AE title configuration.  Each tenant can be
+assigned a unique AE title prefix so that modalities can route DICOM
+associations to the correct tenant context.
+
+| Setting                             | Description                                             |
+|-------------------------------------|---------------------------------------------------------|
+| `SAUTIRIS_DICOM_MWL_AE_TITLE`      | Default MWL AE title (applies to the default tenant)   |
+| Per-tenant AE title overrides       | Configurable via the tenant administration API          |
+
+### 8.3 Association-to-Tenant Mapping
+
+Incoming DICOM associations are mapped to a tenant using the following
+priority order:
+
+1. The Called AE Title of the association, matched against per-tenant AE
+   title configuration.
+2. The `X-Tenant-ID` HTTP header (for DICOMweb / STOW-RS requests).
+3. The default tenant (`SAUTIRIS_DEFAULT_TENANT_ID`) if no match is found.
+
+> **Note**: In production, always configure explicit AE titles per tenant to
+> avoid ambiguous tenant resolution.
+
+### 8.4 DICOM Metadata Segregation
+
+DICOM datasets forwarded to the PACS adapter are not modified with tenant
+identifiers (to preserve standard DICOM compliance).  Tenant context is
+maintained exclusively within the SautiRIS database and is not embedded in
+DICOM datasets.
+
+---
+
+## 9. Limitations and Notes
+
+1. **MWL Matching**: Universal (empty=all), exact, and wildcard (`*`, `?`) matching supported for PatientName. Fuzzy (phonetic) matching is not supported.
 2. **C-MOVE**: Not implemented. PACS retrieval uses DICOMweb WADO-RS instead.
 3. **C-GET**: Not implemented.
 4. **Storage Commitment**: Not implemented in v1.0.

@@ -170,6 +170,11 @@ class TestAPIKeyAuthProviderValidKey:
             await provider.authenticate(request)
 
         assert exc_info.value.status_code == 401
+        # GAP-4: verify detail does not leak key value or prefix
+        detail = exc_info.value.detail
+        assert detail == "Invalid or expired API key"
+        assert raw_key not in detail
+        assert raw_key[:12] not in detail
 
 
 class TestAPIKeyExpiry:
@@ -286,3 +291,40 @@ class TestAPIKeyAuthProviderInvalidSessionFactory:
 
         with pytest.raises(RuntimeError, match="expected AsyncSession"):
             await provider.authenticate(request)
+
+
+class TestLastUsedAtFailureResilience:
+    """GAP-7: last_used_at update failure must not block authentication."""
+
+    async def test_last_used_at_failure_still_authenticates(self) -> None:
+        """If last_used_at UPDATE raises, the key is still returned (auth succeeds)."""
+        from sautiris.core.auth.apikey import _CrossTenantApiKeyRepository
+        from sautiris.repositories.apikey_repo import hash_key
+
+        raw_key = "sautiris_resilience1234567890123456789"
+        prefix = raw_key[:12]
+        key_hash = hash_key(raw_key)
+
+        valid_key = MagicMock()
+        valid_key.key_prefix = prefix
+        valid_key.key_hash = key_hash
+        valid_key.is_active = True
+        valid_key.expires_at = None
+        valid_key.id = uuid.uuid4()
+        valid_key.user_id = uuid.uuid4()
+        valid_key.tenant_id = uuid.uuid4()
+        valid_key.permissions = ["order:read"]
+
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = [valid_key]
+
+        mock_session = AsyncMock()
+        # First execute returns the key candidates (SELECT)
+        # Second execute (UPDATE last_used_at) raises an exception
+        mock_session.execute.side_effect = [mock_result, RuntimeError("DB write failed")]
+
+        repo = _CrossTenantApiKeyRepository(mock_session)
+        result = await repo.verify_any_tenant(raw_key)
+
+        # Auth must succeed despite last_used_at failure
+        assert result is valid_key

@@ -11,19 +11,22 @@ unchanged (suitable for development).  Run with the env var set in staging/prod.
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Sequence
 
 from alembic import op
 from sqlalchemy import text
 
+# #79: Import _FERNET_PREFIX from crypto module instead of redefining it
+from sautiris.core.crypto import _FERNET_PREFIX  # noqa: PLC0415
+
+logger = logging.getLogger(__name__)
+
 revision: str = "ris003"
 down_revision: str | None = "ris002"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
-
-# Fernet-encrypted values start with "gAAAAAB"
-_FERNET_PREFIX = "gAAAAAB"
 
 
 def upgrade() -> None:
@@ -37,6 +40,11 @@ def upgrade() -> None:
 
     fernet = Fernet(raw_key.encode())
     conn = op.get_bind()
+    # encrypted_count tracks the number of *rows* that were re-encrypted across
+    # all tables.  We deliberately count rows (not individual column values)
+    # because the log message and key-rotation CLI output report "credential
+    # records" — the number of database rows touched, not the number of columns.
+    encrypted_count = 0
 
     # --- Encrypt pacs_connections.password ---
     pacs_rows = conn.execute(
@@ -49,6 +57,8 @@ def upgrade() -> None:
                 text("UPDATE pacs_connections SET password = :p WHERE id = :id"),
                 {"p": encrypted, "id": str(row_id)},
             )
+            # Increment once per *row* encrypted (not per column).
+            encrypted_count += 1
 
     # --- Encrypt ai_provider_configs.api_key and .webhook_secret ---
     ai_rows = conn.execute(
@@ -72,6 +82,12 @@ def upgrade() -> None:
                 ),
                 updates,
             )
+            # Increment once per *row* — not once per column (api_key,
+            # webhook_secret).  Using len(updates) would count encrypted
+            # *columns* rather than encrypted *rows*, which is misleading.
+            encrypted_count += 1
+
+    logger.info("ris003: encrypted %d credential rows across all tables", encrypted_count)
 
 
 def downgrade() -> None:

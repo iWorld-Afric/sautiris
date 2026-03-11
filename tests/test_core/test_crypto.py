@@ -167,3 +167,183 @@ class TestConfigValidation:
             database_url="sqlite+aiosqlite:///:memory:",
         )
         settings.validate_security()  # specific origins with credentials is OK
+
+    def test_dicom_tls_enabled_without_cert_raises(self) -> None:
+        """M16/H9: dicom_tls_enabled=True without cert/key raises ConfigurationError."""
+        from sautiris.config import ConfigurationError, SautiRISSettings
+
+        settings = SautiRISSettings(
+            dicom_tls_enabled=True,
+            dicom_tls_cert="",
+            dicom_tls_key="",
+            database_url="sqlite+aiosqlite:///:memory:",
+        )
+        with pytest.raises(ConfigurationError, match="dicom_tls_cert"):
+            settings.validate_security()
+
+    def test_dicom_tls_enabled_without_key_raises(self) -> None:
+        """dicom_tls_enabled=True with cert but no key raises ConfigurationError."""
+        from sautiris.config import ConfigurationError, SautiRISSettings
+
+        settings = SautiRISSettings(
+            dicom_tls_enabled=True,
+            dicom_tls_cert="/path/to/cert.pem",
+            dicom_tls_key="",
+            database_url="sqlite+aiosqlite:///:memory:",
+        )
+        with pytest.raises(ConfigurationError, match="dicom_tls_key"):
+            settings.validate_security()
+
+    def test_dicom_tls_enabled_with_cert_and_key_ok(self) -> None:
+        """dicom_tls_enabled=True with both cert and key passes validation."""
+        from sautiris.config import SautiRISSettings
+
+        settings = SautiRISSettings(
+            dicom_tls_enabled=True,
+            dicom_tls_cert="/path/to/cert.pem",
+            dicom_tls_key="/path/to/key.pem",
+            database_url="sqlite+aiosqlite:///:memory:",
+        )
+        settings.validate_security()  # should not raise
+
+    def test_dicom_tls_disabled_without_cert_ok(self) -> None:
+        """dicom_tls_enabled=False without cert/key passes validation."""
+        from sautiris.config import SautiRISSettings
+
+        settings = SautiRISSettings(
+            dicom_tls_enabled=False,
+            dicom_tls_cert="",
+            dicom_tls_key="",
+            database_url="sqlite+aiosqlite:///:memory:",
+        )
+        settings.validate_security()  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# R2-H9: Corrupted Fernet ciphertext handling
+# ---------------------------------------------------------------------------
+
+
+class TestCorruptedFernetCiphertext:
+    """EncryptedString must raise DecryptionError on corrupted Fernet tokens."""
+
+    def test_corrupted_fernet_token_raises_decryption_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A value starting with 'gAAAAA' but with corrupted content raises DecryptionError."""
+        from cryptography.fernet import Fernet
+
+        key = Fernet.generate_key().decode()
+        monkeypatch.setenv("SAUTIRIS_ENCRYPTION_KEY", key)
+        enc = EncryptedString()
+
+        # Corrupt a real Fernet token by mangling bytes in the middle
+        real_encrypted = enc.process_bind_param("real_secret", None)
+        assert real_encrypted is not None
+        # Corrupt by replacing characters in the middle
+        corrupted = real_encrypted[:15] + "XXXX_CORRUPTED" + real_encrypted[29:]
+
+        # Must raise DecryptionError, not silently return corrupted data
+        with pytest.raises(DecryptionError, match="could not be decrypted"):
+            enc.process_result_value(corrupted, None)
+
+    def test_fernet_prefix_without_valid_content_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A value that starts with gAAAAA but isn't valid Fernet raises DecryptionError."""
+        from cryptography.fernet import Fernet
+
+        key = Fernet.generate_key().decode()
+        monkeypatch.setenv("SAUTIRIS_ENCRYPTION_KEY", key)
+        enc = EncryptedString()
+
+        with pytest.raises(DecryptionError):
+            enc.process_result_value("gAAAAABthis_is_not_valid_fernet_at_all", None)
+
+
+# ---------------------------------------------------------------------------
+# R2-C4: Key rotation — skipped plaintext + decrypt error handling
+# ---------------------------------------------------------------------------
+
+
+class TestKeyRotationDetailedResults:
+    """rotate_encryption_key_detailed returns rotated_count and skipped_count."""
+
+    def test_rotation_skips_plaintext_and_logs_warning(self) -> None:
+        """Plaintext values are skipped with a warning; skipped_count is incremented."""
+        from unittest.mock import MagicMock
+
+        from cryptography.fernet import Fernet
+
+        from sautiris.core.crypto import (
+            _ENCRYPTED_COLUMNS,
+            KeyRotationResult,
+            rotate_encryption_key_detailed,
+        )
+
+        old_key = Fernet.generate_key().decode()
+        new_key = Fernet.generate_key().decode()
+
+        # Build a mock connection that returns one row with a plaintext value
+        mock_conn = MagicMock()
+        # For each table, return a row with id + one plaintext column value
+        row_data = []
+        for _table, columns in _ENCRYPTED_COLUMNS:
+            row = ["row-id-1"] + ["plaintext_value"] * len(columns)
+            row_data.append([tuple(row)])
+
+        call_idx = {"i": 0}
+
+        def _mock_execute(stmt, params=None):
+            result = MagicMock()
+            if "SELECT" in str(stmt):
+                idx = call_idx["i"]
+                call_idx["i"] += 1
+                result.fetchall.return_value = row_data[idx] if idx < len(row_data) else []
+            return result
+
+        mock_conn.execute = _mock_execute
+
+        result = rotate_encryption_key_detailed(mock_conn, old_key, new_key)
+        assert isinstance(result, KeyRotationResult)
+        assert result.rotated_count == 0
+        assert result.skipped_count > 0
+
+    def test_rotation_raises_on_corrupted_ciphertext(self) -> None:
+        """DecryptionError raised when old key can't decrypt a Fernet-looking value."""
+        from unittest.mock import MagicMock
+
+        from cryptography.fernet import Fernet
+
+        from sautiris.core.crypto import (
+            _ENCRYPTED_COLUMNS,
+            _FERNET_PREFIX,
+            rotate_encryption_key_detailed,
+        )
+
+        old_key = Fernet.generate_key().decode()
+        new_key = Fernet.generate_key().decode()
+
+        # Build fake Fernet token (right prefix, wrong content)
+        fake_fernet = _FERNET_PREFIX + "AAAA_NOT_REAL_FERNET_DATA_HERE=="
+
+        mock_conn = MagicMock()
+        row_data = []
+        for _table, columns in _ENCRYPTED_COLUMNS:
+            row = ["row-id-1"] + [fake_fernet] * len(columns)
+            row_data.append([tuple(row)])
+
+        call_idx = {"i": 0}
+
+        def _mock_execute(stmt, params=None):
+            result = MagicMock()
+            if "SELECT" in str(stmt):
+                idx = call_idx["i"]
+                call_idx["i"] += 1
+                result.fetchall.return_value = row_data[idx] if idx < len(row_data) else []
+            return result
+
+        mock_conn.execute = _mock_execute
+
+        with pytest.raises(DecryptionError, match="Failed to decrypt"):
+            rotate_encryption_key_detailed(mock_conn, old_key, new_key)

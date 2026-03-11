@@ -10,8 +10,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sautiris.api.deps import get_db, require_permission
+from sautiris.api.deps import get_db, get_event_bus, require_permission
 from sautiris.core.auth.base import AuthUser
+from sautiris.core.events import EventBus
 from sautiris.models.alert import AlertType, AlertUrgency, NotificationMethod
 from sautiris.services.alert_service import AlertService
 
@@ -52,10 +53,6 @@ class AlertResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class AlertAcknowledgeRequest(BaseModel):
-    pass
-
-
 class AlertStatsResponse(BaseModel):
     total: int
     pending: int
@@ -72,10 +69,11 @@ class AlertStatsResponse(BaseModel):
 async def create_alert(
     body: AlertCreateRequest,
     db: AsyncSession = Depends(get_db),
+    event_bus: EventBus = Depends(get_event_bus),
     user: AuthUser = Depends(require_permission("alert:create")),
 ) -> object:
     """Create a critical alert and dispatch notification."""
-    svc = AlertService(db)
+    svc = AlertService(db, event_bus=event_bus)
     alert = await svc.create_alert(
         order_id=body.order_id,
         report_id=body.report_id,

@@ -10,10 +10,10 @@ from types import SimpleNamespace
 
 from pydicom.dataset import Dataset
 
+from sautiris.integrations.dicom.constants import DEFAULT_TRANSFER_SYNTAXES as TRANSFER_SYNTAXES
 from sautiris.integrations.dicom.mwl_scp import (
     CHARSET_UTF8,
     MWL_FIND_SOP_CLASS,
-    TRANSFER_SYNTAXES,
     MWLServer,
     extract_query_filters,
     worklist_item_to_dataset,
@@ -274,11 +274,47 @@ class TestIssue3RequiredTags:
         ds = worklist_item_to_dataset(item)
         assert ds.PregnancyStatus == 2
 
-    def test_pregnancy_status_absent_when_none(self) -> None:
+    def test_pregnancy_status_present_when_none(self) -> None:
+        """Type 2: PregnancyStatus MUST be present even when None (zero-length allowed).
+
+        Issue #15: pydicom raises a warning when assigning "" to a VR US tag.
+        The correct zero-length representation for VR US is None (pydicom stores
+        the tag as present with None value, which is valid for Type 2 tags).
+        """
         item = _make_worklist_item(study_instance_uid=None)
         ds = worklist_item_to_dataset(item)
-        # Not set when None — no attribute
-        assert not hasattr(ds, "PregnancyStatus")
+        assert hasattr(ds, "PregnancyStatus")
+        # None represents a valid zero-length VR US value (avoids pydicom warning)
+        assert ds.PregnancyStatus is None
+
+    def test_scheduled_protocol_code_sequence_present(self) -> None:
+        """Type 2: ScheduledProtocolCodeSequence (0040,0008) must be present."""
+        item = _make_worklist_item()
+        ds = worklist_item_to_dataset(item)
+        sps = ds.ScheduledProcedureStepSequence[0]
+        assert hasattr(sps, "ScheduledProtocolCodeSequence")
+        assert len(sps.ScheduledProtocolCodeSequence) == 0
+
+    def test_referenced_patient_sequence_present(self) -> None:
+        """Type 2: ReferencedPatientSequence (0008,1120) must be present."""
+        item = _make_worklist_item()
+        ds = worklist_item_to_dataset(item)
+        assert hasattr(ds, "ReferencedPatientSequence")
+        assert len(ds.ReferencedPatientSequence) == 0
+
+    def test_admission_id_present(self) -> None:
+        """Type 2: AdmissionID (0038,0010) must be present."""
+        item = _make_worklist_item()
+        ds = worklist_item_to_dataset(item)
+        assert hasattr(ds, "AdmissionID")
+        assert ds.AdmissionID == ""
+
+    def test_issuer_of_patient_id_present(self) -> None:
+        """Type 2: IssuerOfPatientID (0010,0021) must be present."""
+        item = _make_worklist_item()
+        ds = worklist_item_to_dataset(item)
+        assert hasattr(ds, "IssuerOfPatientID")
+        assert ds.IssuerOfPatientID == ""
 
 
 class TestIssue3QueryFilters:
@@ -381,3 +417,450 @@ class TestMWLServer:
 
     def test_sop_class_uid(self) -> None:
         assert MWL_FIND_SOP_CLASS == "1.2.840.10008.5.1.4.31"
+
+
+class TestScheduledPerformingPhysicianName:
+    """G3-2: ScheduledPerformingPhysicianName in SPS response."""
+
+    def test_performing_physician_present_in_sps(self) -> None:
+        item = _make_worklist_item(scheduled_performing_physician_name="DR^JONES")
+        ds = worklist_item_to_dataset(item)
+        sps = ds.ScheduledProcedureStepSequence[0]
+        assert str(sps.ScheduledPerformingPhysicianName) == "DR^JONES"
+
+    def test_performing_physician_empty_when_none(self) -> None:
+        item = _make_worklist_item()
+        ds = worklist_item_to_dataset(item)
+        sps = ds.ScheduledProcedureStepSequence[0]
+        assert str(sps.ScheduledPerformingPhysicianName) == ""
+
+
+class TestPatientNameWildcardFilters:
+    """G3-1: DICOM wildcard matching for PatientName C-FIND queries."""
+
+    def test_wildcard_star_suffix(self) -> None:
+        ds = Dataset()
+        ds.PatientName = "DOE*"
+        filters = extract_query_filters(ds)
+        assert "patient_name" not in filters
+        assert filters["patient_name_pattern"] == "DOE%"
+
+    def test_wildcard_question_mark(self) -> None:
+        ds = Dataset()
+        ds.PatientName = "DO?"
+        filters = extract_query_filters(ds)
+        assert filters["patient_name_pattern"] == "DO_"
+
+    def test_wildcard_combined(self) -> None:
+        ds = Dataset()
+        ds.PatientName = "D?E*"
+        filters = extract_query_filters(ds)
+        assert filters["patient_name_pattern"] == "D_E%"
+
+    def test_exact_match_no_wildcards(self) -> None:
+        ds = Dataset()
+        ds.PatientName = "DOE^JOHN"
+        filters = extract_query_filters(ds)
+        assert filters["patient_name"] == "DOE^JOHN"
+        assert "patient_name_pattern" not in filters
+
+    def test_wildcard_star_only(self) -> None:
+        ds = Dataset()
+        ds.PatientName = "*"
+        filters = extract_query_filters(ds)
+        assert filters["patient_name_pattern"] == "%"
+
+
+class TestSQLLIKEMetacharacterEscaping:
+    """R2-H3: SQL LIKE metacharacters (% and _) must be escaped before wildcard conversion."""
+
+    def test_literal_percent_escaped_in_wildcard_query(self) -> None:
+        """Patient name '100%*' should escape % before converting * to %."""
+        ds = Dataset()
+        ds.PatientName = "100%*"
+        filters = extract_query_filters(ds)
+        assert filters["patient_name_pattern"] == r"100\%%"
+
+    def test_literal_underscore_escaped_in_wildcard_query(self) -> None:
+        """Patient name 'DOE_J*' should escape _ before converting * to %."""
+        ds = Dataset()
+        ds.PatientName = "DOE_J*"
+        filters = extract_query_filters(ds)
+        assert filters["patient_name_pattern"] == r"DOE\_J%"
+
+    def test_both_metacharacters_escaped(self) -> None:
+        """Both % and _ literals are escaped in wildcard queries."""
+        ds = Dataset()
+        ds.PatientName = "100%_TEST*"
+        filters = extract_query_filters(ds)
+        assert filters["patient_name_pattern"] == r"100\%\_TEST%"
+
+    def test_no_metacharacters_no_change(self) -> None:
+        """Normal wildcard query without SQL metacharacters is unchanged."""
+        ds = Dataset()
+        ds.PatientName = "DOE*"
+        filters = extract_query_filters(ds)
+        assert filters["patient_name_pattern"] == "DOE%"
+
+    def test_exact_match_with_percent_not_escaped(self) -> None:
+        """Exact match (no DICOM wildcards) doesn't touch SQL metacharacters."""
+        ds = Dataset()
+        ds.PatientName = "100% Smith"
+        filters = extract_query_filters(ds)
+        # No wildcards → exact match path, not LIKE pattern
+        assert filters["patient_name"] == "100% Smith"
+        assert "patient_name_pattern" not in filters
+
+
+# ---------------------------------------------------------------------------
+# GAP-2: _handle_find callback exception path
+# ---------------------------------------------------------------------------
+
+
+class TestHandleFindCallbackErrors:
+    """GAP-2: _handle_find must yield 0xC001 when query_callback raises."""
+
+    def test_callback_exception_yields_error_status(self) -> None:
+        """When query_callback raises, _handle_find yields (0xC001, None)."""
+        import asyncio
+        import threading
+
+        async def _failing_callback(filters: dict) -> list:
+            raise RuntimeError("Database connection lost")
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            server = MWLServer(query_callback=_failing_callback, loop=loop)
+            identifier = Dataset()  # empty = universal match
+            event_mock = SimpleNamespace(identifier=identifier)
+            results = list(server._handle_find(event_mock))
+            assert len(results) == 1
+            status, ds = results[0]
+            assert status == 0xC001
+            assert ds is None
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2.0)
+            loop.close()
+
+
+# ---------------------------------------------------------------------------
+# GAP-3: _handle_find per-item conversion error isolation
+# ---------------------------------------------------------------------------
+
+
+class TestHandleFindItemConversionError:
+    """GAP-3: A single bad item must not abort the entire C-FIND."""
+
+    def test_bad_item_skipped_others_returned(self) -> None:
+        """If worklist_item_to_dataset raises for one item, others still yield."""
+        import asyncio
+        import threading
+
+        good_item_1 = _make_worklist_item(patient_id="PAT-GOOD-1")
+
+        # Create a bad item that raises during dataset conversion by using
+        # a property that explodes when accessed
+        class _ExplodingItem:
+            """Mock item that raises when patient_name is accessed."""
+
+            id = "BAD-ITEM"
+
+            @property
+            def patient_name(self) -> str:
+                raise ValueError("Corrupted DB record")
+
+        bad_item = _ExplodingItem()
+        good_item_3 = _make_worklist_item(patient_id="PAT-GOOD-3")
+
+        async def _callback(filters: dict) -> list:
+            return [good_item_1, bad_item, good_item_3]
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            server = MWLServer(query_callback=_callback, loop=loop)
+            identifier = Dataset()
+            event_mock = SimpleNamespace(identifier=identifier)
+            results = list(server._handle_find(event_mock))
+            # Only good items should be returned (0xFF00 = pending match)
+            success_results = [(s, d) for s, d in results if s == 0xFF00]
+            assert len(success_results) == 2
+            patient_ids = [str(d.PatientID) for _, d in success_results]
+            assert "PAT-GOOD-1" in patient_ids
+            assert "PAT-GOOD-3" in patient_ids
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2.0)
+            loop.close()
+
+
+# ---------------------------------------------------------------------------
+# GAP-6: Shared constants.py direct coverage
+# ---------------------------------------------------------------------------
+
+
+class TestSharedConstants:
+    """GAP-6: Verify shared constants from constants.py are correct."""
+
+    def test_charset_utf8_value(self) -> None:
+        from sautiris.integrations.dicom.constants import CHARSET_UTF8 as SHARED_CHARSET
+
+        assert SHARED_CHARSET == "ISO_IR 192"
+
+    def test_default_transfer_syntaxes_count(self) -> None:
+        from sautiris.integrations.dicom.constants import DEFAULT_TRANSFER_SYNTAXES
+
+        assert len(DEFAULT_TRANSFER_SYNTAXES) == 8
+
+    def test_default_transfer_syntaxes_contains_key_uids(self) -> None:
+        from sautiris.integrations.dicom.constants import DEFAULT_TRANSFER_SYNTAXES
+
+        assert "1.2.840.10008.1.2.1" in DEFAULT_TRANSFER_SYNTAXES  # Explicit VR LE
+        assert "1.2.840.10008.1.2" in DEFAULT_TRANSFER_SYNTAXES  # Implicit VR LE
+
+
+# ---------------------------------------------------------------------------
+# GAP-8: Open-ended date range patterns
+# ---------------------------------------------------------------------------
+
+
+class TestOpenEndedDateRanges:
+    """GAP-8: DICOM open-ended date range queries."""
+
+    def test_open_end_date_range(self) -> None:
+        """'20260301-' sets date_from only."""
+        ds = Dataset()
+        sps = Dataset()
+        sps.ScheduledProcedureStepStartDate = "20260301-"
+        ds.ScheduledProcedureStepSequence = [sps]
+        filters = extract_query_filters(ds)
+        assert filters["date_from"] == date(2026, 3, 1)
+        assert "date_to" not in filters
+
+    def test_open_start_date_range(self) -> None:
+        """'-20260305' sets date_to only."""
+        ds = Dataset()
+        sps = Dataset()
+        sps.ScheduledProcedureStepStartDate = "-20260305"
+        ds.ScheduledProcedureStepSequence = [sps]
+        filters = extract_query_filters(ds)
+        assert "date_from" not in filters
+        assert filters["date_to"] == date(2026, 3, 5)
+
+
+# ---------------------------------------------------------------------------
+# StudyInstanceUID persistence — same UID across repeated queries
+# ---------------------------------------------------------------------------
+
+
+class TestStudyInstanceUIDPersistence:
+    """Verify that a persisted study_instance_uid is returned consistently."""
+
+    def test_persisted_uid_returned_on_repeated_calls(self) -> None:
+        """Same worklist item must return same StudyInstanceUID every time."""
+        uid = "1.2.826.0.1.3680043.9.7539.99.1"
+        item = _make_worklist_item(study_instance_uid=uid)
+        ds1 = worklist_item_to_dataset(item)
+        ds2 = worklist_item_to_dataset(item)
+        assert str(ds1.StudyInstanceUID) == uid
+        assert str(ds2.StudyInstanceUID) == uid
+
+    def test_none_uid_generates_uid_each_call(self) -> None:
+        """Legacy items without persisted UID still get a generated UID."""
+        item = _make_worklist_item(study_instance_uid=None)
+        ds = worklist_item_to_dataset(item)
+        uid = str(ds.StudyInstanceUID)
+        assert uid and "." in uid  # valid DICOM UID format
+
+    def test_empty_string_uid_generates_new_uid(self) -> None:
+        """Empty string UID should be treated as absent and generate a new one."""
+        item = _make_worklist_item(study_instance_uid="")
+        ds = worklist_item_to_dataset(item)
+        uid = str(ds.StudyInstanceUID)
+        assert uid and uid != ""  # should be a generated UID, not empty
+
+
+# ---------------------------------------------------------------------------
+# R2-H4: Shared build_dicom_ssl_context tests
+# ---------------------------------------------------------------------------
+
+
+class TestBuildDicomSSLContext:
+    """R2-H4: Shared build_dicom_ssl_context utility in constants.py."""
+
+    def test_returns_none_when_no_cert(self) -> None:
+        from sautiris.integrations.dicom.constants import build_dicom_ssl_context
+
+        result = build_dicom_ssl_context("", "", "")
+        assert result is None
+
+    def test_returns_none_when_no_key(self) -> None:
+        from sautiris.integrations.dicom.constants import build_dicom_ssl_context
+
+        result = build_dicom_ssl_context("/path/to/cert.pem", "", "")
+        assert result is None
+
+    def test_returns_none_when_both_empty(self) -> None:
+        from sautiris.integrations.dicom.constants import build_dicom_ssl_context
+
+        result = build_dicom_ssl_context("", "/path/to/key.pem", "")
+        assert result is None
+
+    def test_all_three_scp_classes_delegate_to_shared_helper(self) -> None:
+        """All 3 SCP _build_ssl_context methods delegate to the shared function."""
+        from sautiris.integrations.dicom.mpps_scp import MPPSServer
+        from sautiris.integrations.dicom.store_scp import StoreSCPServer
+
+        # Without TLS config, all return None (via shared helper)
+        mpps = MPPSServer()
+        mwl = MWLServer()
+        store = StoreSCPServer()
+
+        assert mpps._build_ssl_context() is None
+        assert mwl._build_ssl_context() is None
+        assert store._build_ssl_context() is None
+
+
+# ---------------------------------------------------------------------------
+# #58: StudyInstanceUID is preserved across the full MWL round-trip
+# ---------------------------------------------------------------------------
+
+
+class TestStudyInstanceUIDRoundTrip:
+    """#58: study_instance_uid set on a WorklistItem must appear in the MWL response dataset.
+
+    Verifies that when a worklist item carries a pre-assigned StudyInstanceUID
+    (e.g. from a prior MPPS N-CREATE), worklist_item_to_dataset() returns that
+    exact UID — not a freshly generated one.  This is the key persistence guarantee
+    that ensures the modality and RIS agree on the same Study UID.
+    """
+
+    def test_study_instance_uid_preserved_in_worklist_response(self) -> None:
+        """A WorklistItem's study_instance_uid survives the item → DICOM dataset conversion.
+
+        Round-trip: assign a known UID to item → call worklist_item_to_dataset()
+        → read StudyInstanceUID from the returned Dataset → must match exactly.
+        """
+        known_uid = "1.2.826.0.1.3680043.9.7539.1.20260310.1"
+        item = _make_worklist_item(study_instance_uid=known_uid)
+
+        ds = worklist_item_to_dataset(item)
+
+        assert hasattr(ds, "StudyInstanceUID"), "Dataset must have StudyInstanceUID tag"
+        returned_uid = str(ds.StudyInstanceUID)
+        assert returned_uid == known_uid, (
+            f"UID mismatch: expected {known_uid!r}, got {returned_uid!r}. "
+            "The MWL response must return the persisted UID, not generate a new one."
+        )
+
+    def test_none_study_instance_uid_generates_valid_uid(self) -> None:
+        """If study_instance_uid is None, a valid DICOM UID is generated (not empty/None)."""
+        item = _make_worklist_item(study_instance_uid=None)
+        ds = worklist_item_to_dataset(item)
+
+        uid = str(ds.StudyInstanceUID)
+        assert uid, "Generated UID must not be empty"
+        assert "." in uid, f"Generated UID must contain dots: {uid!r}"
+
+    def test_generated_uid_changes_for_different_items(self) -> None:
+        """Two items without a pre-assigned UID each get distinct generated UIDs."""
+        item_a = _make_worklist_item(study_instance_uid=None, patient_id="PAT-A")
+        item_b = _make_worklist_item(study_instance_uid=None, patient_id="PAT-B")
+
+        ds_a = worklist_item_to_dataset(item_a)
+        ds_b = worklist_item_to_dataset(item_b)
+
+        uid_a = str(ds_a.StudyInstanceUID)
+        uid_b = str(ds_b.StudyInstanceUID)
+        assert uid_a != uid_b, f"Two distinct items must receive distinct UIDs, got same: {uid_a!r}"
+
+
+# ---------------------------------------------------------------------------
+# M17: BaseSCPServer _build_handler_list immutability
+# ---------------------------------------------------------------------------
+
+
+class TestBuildHandlerListImmutability:
+    """M17/H12: _build_handler_list must NOT mutate the input list."""
+
+    def test_does_not_mutate_input(self) -> None:
+        from unittest.mock import MagicMock
+
+        from sautiris.integrations.dicom.security import DicomAssociationSecurity
+
+        security = MagicMock(spec=DicomAssociationSecurity)
+        server = MWLServer(security=security)
+        original = [("evt_c_find", lambda e: None)]
+        original_copy = list(original)
+        result = server._build_handler_list(original)
+        # Original must be unchanged
+        assert original == original_copy
+        # Result must contain the original handler + security handlers
+        assert len(result) > len(original_copy)
+
+
+# ---------------------------------------------------------------------------
+# M18: extract_query_filters exact patient name case
+# ---------------------------------------------------------------------------
+
+
+class TestExtractQueryFiltersExactPatientName:
+    """M18/C2: extract_query_filters with non-wildcard patient name."""
+
+    def test_exact_patient_name(self) -> None:
+        ds = Dataset()
+        ds.PatientName = "Smith^John"
+        filters = extract_query_filters(ds)
+        assert filters.get("patient_name") == "Smith^John"
+        assert "patient_name_pattern" not in filters
+
+    def test_wildcard_patient_name(self) -> None:
+        ds = Dataset()
+        ds.PatientName = "Smith*"
+        filters = extract_query_filters(ds)
+        assert "patient_name" not in filters
+        assert filters.get("patient_name_pattern") == "Smith%"
+
+    def test_question_mark_wildcard(self) -> None:
+        ds = Dataset()
+        ds.PatientName = "Sm?th"
+        filters = extract_query_filters(ds)
+        assert "patient_name" not in filters
+        assert filters.get("patient_name_pattern") == "Sm_th"
+
+
+# ---------------------------------------------------------------------------
+# M20: MWL _handle_find logging sanitization
+# ---------------------------------------------------------------------------
+
+
+class TestHandleFindLoggingSanitization:
+    """M20/M1: verify patient data is redacted in logs."""
+
+    def test_filters_are_sanitized_for_logging(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        server = MWLServer()
+
+        # Create a C-FIND event with patient name
+        ds = Dataset()
+        ds.PatientName = "Smith^John"
+        ds.PatientID = "PAT001"
+        event = MagicMock()
+        event.identifier = ds
+
+        with patch("sautiris.integrations.dicom.mwl_scp.logger") as mock_logger:
+            # _handle_find is a generator, consume it
+            list(server._handle_find(event))
+            mock_logger.info.assert_called()
+            call_kwargs = mock_logger.info.call_args[1]
+            logged_filters = call_kwargs.get("filters", {})
+            # Patient data should be redacted
+            if "patient_name" in logged_filters:
+                assert logged_filters["patient_name"] == "[REDACTED]"
+            if "patient_id" in logged_filters:
+                assert logged_filters["patient_id"] == "[REDACTED]"

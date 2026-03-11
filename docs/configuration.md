@@ -77,6 +77,45 @@ SautiRIS uses Pydantic Settings with environment variable support. All settings 
 | `SAUTIRIS_ENABLE_PEER_REVIEW` | `true` | Enable peer review QA |
 | `SAUTIRIS_ENABLE_BILLING` | `true` | Enable billing module |
 
+### CORS
+
+Cross-Origin Resource Sharing (CORS) controls which browser origins are
+permitted to make requests to the SautiRIS API.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SAUTIRIS_CORS_ORIGINS` | `["*"]` | Comma-separated list of allowed origins (e.g. `https://app.example.com,https://admin.example.com`) |
+| `SAUTIRIS_CORS_ALLOW_CREDENTIALS` | `false` | Allow credentials (cookies, Authorization header) to be sent cross-origin |
+| `SAUTIRIS_CORS_ALLOW_HEADERS` | (see below) | Additional request headers to allow beyond the defaults |
+
+**Default allowed headers** include the standard set plus SautiRIS-specific
+headers: `X-Tenant-ID`, `X-API-Key`, and `X-Correlation-ID`.
+
+#### Security Warning
+
+> **Do NOT use `*` for `SAUTIRIS_CORS_ORIGINS` in production.** A wildcard
+> origin bypasses the Same-Origin Policy for all domains and can expose PHI
+> to malicious websites via cross-site request forgery and data exfiltration
+> attacks.
+
+#### Production Example
+
+```env
+# Allow only the production frontend and admin dashboard
+SAUTIRIS_CORS_ORIGINS=https://ris.hospital.example.com,https://admin.hospital.example.com
+SAUTIRIS_CORS_ALLOW_CREDENTIALS=true
+```
+
+#### Development Example
+
+```env
+# Allow local development servers only
+SAUTIRIS_CORS_ORIGINS=http://localhost:3000,http://localhost:5173
+SAUTIRIS_CORS_ALLOW_CREDENTIALS=true
+```
+
+---
+
 ### Multi-Tenancy
 
 | Variable | Default | Description |
@@ -93,7 +132,7 @@ SautiRIS uses Pydantic Settings with environment variable support. All settings 
 | `SAUTIRIS_PORT` | `8080` | Server bind port |
 | `SAUTIRIS_WORKERS` | `1` | Uvicorn worker count |
 | `SAUTIRIS_LOG_LEVEL` | `info` | Log level |
-| `SAUTIRIS_CORS_ORIGINS` | `["*"]` | CORS allowed origins |
+| `SAUTIRIS_CORS_ORIGINS` | `["*"]` | CORS allowed origins (see CORS section above) |
 
 ## .env File
 

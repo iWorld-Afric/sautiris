@@ -47,7 +47,7 @@ class DomainEvent:
     """
 
     event_type: str
-    payload: dict[str, Any]
+    payload: dict[str, Any] = field(default_factory=dict)
     event_id: UUID = field(default_factory=uuid4)
     timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
     tenant_id: UUID | None = None
@@ -69,7 +69,6 @@ class OrderCreated(DomainEvent):
 
     # HIGH-5: init=False prevents callers from overriding the event type string
     event_type: str = field(init=False, default="order.created")
-    payload: dict[str, Any] = field(default_factory=dict)
 
     # Typed convenience fields
     order_id: str = ""
@@ -85,7 +84,6 @@ class OrderScheduled(DomainEvent):
     """Emitted when a radiology order is scheduled."""
 
     event_type: str = field(init=False, default="order.scheduled")  # HIGH-5
-    payload: dict[str, Any] = field(default_factory=dict)
 
     order_id: str = ""
     schedule_slot_id: str = ""
@@ -99,7 +97,6 @@ class ExamStarted(DomainEvent):
     """Emitted when an exam begins (MPPS N-CREATE)."""
 
     event_type: str = field(init=False, default="exam.started")  # HIGH-5
-    payload: dict[str, Any] = field(default_factory=dict)
 
     order_id: str = ""
     worklist_item_id: str = ""
@@ -112,7 +109,6 @@ class ExamCompleted(DomainEvent):
     """Emitted when an exam finishes (MPPS N-SET completed)."""
 
     event_type: str = field(init=False, default="exam.completed")  # HIGH-5
-    payload: dict[str, Any] = field(default_factory=dict)
 
     order_id: str = ""
     worklist_item_id: str = ""
@@ -125,7 +121,6 @@ class ReportFinalized(DomainEvent):
     """Emitted when a radiology report reaches FINAL status."""
 
     event_type: str = field(init=False, default="report.finalized")  # HIGH-5
-    payload: dict[str, Any] = field(default_factory=dict)
 
     order_id: str = ""
     report_id: str = ""
@@ -139,7 +134,6 @@ class CriticalFinding(DomainEvent):
     """Emitted when a critical finding is identified."""
 
     event_type: str = field(init=False, default="finding.critical")  # HIGH-5
-    payload: dict[str, Any] = field(default_factory=dict)
 
     order_id: str = ""
     report_id: str = ""
@@ -148,13 +142,16 @@ class CriticalFinding(DomainEvent):
     urgency: str = "IMMEDIATE"
     notified_physician_id: str = ""
 
+    def __post_init__(self) -> None:
+        if not self.order_id:
+            raise ValueError("order_id is required for CriticalFinding")
+
 
 @dataclass
 class DRLExceeded(DomainEvent):
     """Emitted when a dose record exceeds Diagnostic Reference Level thresholds."""
 
     event_type: str = field(init=False, default="dose.drl_exceeded")  # HIGH-5
-    payload: dict[str, Any] = field(default_factory=dict)
 
     order_id: str = ""
     dose_record_id: str = ""
@@ -171,7 +168,6 @@ class AIFindingCreated(DomainEvent):
     """Emitted when an AI model creates a new finding on a study."""
 
     event_type: str = field(init=False, default="ai.finding_created")  # HIGH-5
-    payload: dict[str, Any] = field(default_factory=dict)
 
     order_id: str = ""
     study_instance_uid: str = ""
@@ -181,6 +177,156 @@ class AIFindingCreated(DomainEvent):
     confidence: float | None = None
     finding_id: str = ""
     ai_provider: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Order lifecycle events (Issue #16)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OrderCancelled(DomainEvent):
+    """Emitted when a radiology order is cancelled."""
+
+    event_type: str = field(init=False, default="order.cancelled")
+
+    order_id: str = ""
+    from_status: str = ""
+    reason: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.order_id:
+            raise ValueError("order_id is required for OrderCancelled")
+
+
+@dataclass
+class OrderReported(DomainEvent):
+    """Emitted when a radiology order transitions to REPORTED status."""
+
+    event_type: str = field(init=False, default="order.reported")
+
+    order_id: str = ""
+    from_status: str = ""
+
+
+@dataclass
+class OrderVerified(DomainEvent):
+    """Emitted when a radiology order transitions to VERIFIED status."""
+
+    event_type: str = field(init=False, default="order.verified")
+
+    order_id: str = ""
+    from_status: str = ""
+
+
+@dataclass
+class OrderDistributed(DomainEvent):
+    """Emitted when a radiology order transitions to DISTRIBUTED status."""
+
+    event_type: str = field(init=False, default="order.distributed")
+
+    order_id: str = ""
+    from_status: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Report lifecycle events (Issue #16)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ReportCreated(DomainEvent):
+    """Emitted when a radiology report is created."""
+
+    event_type: str = field(init=False, default="report.created")
+
+    report_id: str = ""
+    order_id: str = ""
+    accession_number: str = ""
+    reported_by: str = ""
+
+
+@dataclass
+class ReportAmended(DomainEvent):
+    """Emitted when a radiology report is amended."""
+
+    event_type: str = field(init=False, default="report.amended")
+
+    report_id: str = ""
+    order_id: str = ""
+    accession_number: str = ""
+    changed_by: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Worklist lifecycle events (Issue #16)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WorklistStatusChanged(DomainEvent):
+    """Emitted when a worklist item status changes (e.g. DISCONTINUED)."""
+
+    event_type: str = field(init=False, default="worklist.status_changed")
+
+    item_id: str = ""
+    order_id: str = ""
+    from_status: str = ""
+    to_status: str = ""
+
+
+@dataclass
+class WorklistMPPSReceived(DomainEvent):
+    """Emitted when an MPPS message is received for a worklist item."""
+
+    event_type: str = field(init=False, default="worklist.mpps_received")
+
+    item_id: str = ""
+    order_id: str = ""
+    mpps_status: str = ""
+    mpps_uid: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Schedule lifecycle events (Issue #16)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ScheduleSlotCreated(DomainEvent):
+    """Emitted when a schedule slot is first created.
+
+    Semantically distinct from ScheduleSlotUpdated: subscribers that care about
+    *new* slot availability (e.g. patient-booking notification, capacity dashboards)
+    should listen for this event.  Downstream consumers that track any change to an
+    existing slot subscribe to ScheduleSlotUpdated instead.
+    """
+
+    event_type: str = field(init=False, default="schedule.slot_created")
+
+    slot_id: str = ""
+    order_id: str = ""
+    room_id: str = ""
+    modality: str = ""
+    status: str = ""
+
+
+@dataclass
+class ScheduleSlotUpdated(DomainEvent):
+    """Emitted when an existing schedule slot is modified.
+
+    Semantically distinct from ScheduleSlotCreated: subscribers that audit slot
+    changes (e.g. conflict monitors, calendar sync, audit trails) subscribe here.
+    The slot already exists; this event signals a *modification*, not creation.
+    """
+
+    event_type: str = field(init=False, default="schedule.slot_updated")
+
+    slot_id: str = ""
+    order_id: str = ""
+    room_id: str = ""
+    modality: str = ""
+    status: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -262,8 +408,11 @@ class EventBus:
             handler_count=len(handlers),
         )
 
+        # #34: Call handlers directly — _safe_call was a no-op try/except/re-raise.
+        # asyncio.gather(return_exceptions=True) already captures exceptions without
+        # the intermediate wrapper.
         results = await asyncio.gather(
-            *(self._safe_call(h, event) for h in handlers),
+            *(h(event) for h in handlers),
             return_exceptions=True,
         )
 
@@ -289,18 +438,6 @@ class EventBus:
             raise critical_error
 
         return errors
-
-    @staticmethod
-    async def _safe_call(handler: EventHandler, event: DomainEvent) -> None:
-        """Invoke handler; re-raise so asyncio.gather captures the exception.
-
-        Callers (service _publish methods) are responsible for logging handler
-        errors — logging here would produce duplicate log entries.
-        """
-        try:
-            await handler(event)
-        except Exception:
-            raise  # Let asyncio.gather capture it; callers log via returned errors
 
     def clear(self) -> None:
         """Remove all subscriptions."""

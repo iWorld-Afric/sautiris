@@ -61,17 +61,23 @@ class ReportRepository(TenantAwareRepository[RadiologyReport]):
         return result.scalars().all(), total
 
     async def get_versions(self, report_id: uuid.UUID) -> Sequence[ReportVersion]:
+        # #5: Filter by tenant_id to prevent cross-tenant version data leakage
         stmt = (
             select(ReportVersion)
-            .where(ReportVersion.report_id == report_id)
+            .where(
+                ReportVersion.report_id == report_id,
+                ReportVersion.tenant_id == self._tenant_id,
+            )
             .order_by(ReportVersion.version_number)
         )
         result = await self.session.execute(stmt)
         return result.scalars().all()
 
     async def get_next_version_number(self, report_id: uuid.UUID) -> int:
+        # #5: Filter by tenant_id to prevent cross-tenant version number collision
         stmt = select(func.coalesce(func.max(ReportVersion.version_number), 0)).where(
-            ReportVersion.report_id == report_id
+            ReportVersion.report_id == report_id,
+            ReportVersion.tenant_id == self._tenant_id,
         )
         result = await self.session.execute(stmt)
         return result.scalar_one() + 1

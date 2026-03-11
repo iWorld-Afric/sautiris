@@ -137,7 +137,9 @@ class TestKeycloakJwtErrors:
             await provider.authenticate(request)
 
         assert exc_info.value.status_code == 401
-        assert "tenant_id" in exc_info.value.detail.lower()
+        # #9: Generic user-facing message hides internal details;
+        # server-side logging (auth.invalid_token) contains the reason.
+        assert exc_info.value.detail == "Invalid or expired token"
 
 
 class TestKeycloakValidJwt:
@@ -246,11 +248,85 @@ class TestKeycloakJwksFetchFailure:
 # ---------------------------------------------------------------------------
 
 
-class TestKeycloakCheckPermission:
-    """check_permission: admin bypass (admin in roles) and per-permission check."""
+# ---------------------------------------------------------------------------
+# #53: UUID validation — non-UUID sub and tenant_id must return 401
+# ---------------------------------------------------------------------------
 
-    async def test_admin_role_bypasses_permission_check(self) -> None:
-        """User with 'admin' in roles must have any permission via admin bypass."""
+
+class TestKeycloakUUIDValidation:
+    """#53: Non-UUID or missing sub/tenant_id claims must return 401.
+
+    The providers must reject tokens where either claim is present but cannot
+    be parsed as a valid UUID, to prevent privilege escalation via malformed
+    claim injection.
+    """
+
+    async def test_non_uuid_sub_returns_401(self) -> None:
+        """sub claim that is not a valid UUID → 401 (not a server error)."""
+        provider = _make_provider()
+        _prime_jwks_cache(provider)
+        payload = _make_valid_payload(sub="not-a-uuid")
+        request = _make_request(authorization="Bearer bad-sub-token")
+
+        with (
+            patch("sautiris.core.auth.keycloak.jwt.decode", return_value=payload),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await provider.authenticate(request)
+
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.detail == "Invalid or expired token"
+
+    async def test_missing_sub_claim_returns_401(self) -> None:
+        """Token with no 'sub' field → 401."""
+        provider = _make_provider()
+        _prime_jwks_cache(provider)
+        tenant_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
+        payload = _make_valid_payload(tenant_id=tenant_id)
+        del payload["sub"]  # remove the sub claim entirely
+        request = _make_request(authorization="Bearer no-sub-token")
+
+        with (
+            patch("sautiris.core.auth.keycloak.jwt.decode", return_value=payload),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await provider.authenticate(request)
+
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.detail == "Invalid or expired token"
+
+    async def test_non_uuid_tenant_id_returns_401(self) -> None:
+        """tenant_id claim that is not a valid UUID → 401."""
+        provider = _make_provider()
+        _prime_jwks_cache(provider)
+        payload = _make_valid_payload()
+        payload["tenant_id"] = "not-a-uuid-at-all"  # override with non-UUID
+        request = _make_request(authorization="Bearer bad-tenant-token")
+
+        with (
+            patch("sautiris.core.auth.keycloak.jwt.decode", return_value=payload),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await provider.authenticate(request)
+
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.detail == "Invalid or expired token"
+
+
+class TestKeycloakCheckPermission:
+    """check_permission: permission-based check (base class behavior).
+
+    The KeycloakAuthProvider now uses the base JWKSAuthProviderBase.check_permission
+    which only checks user.permissions. Admin bypass was removed to centralise
+    permission logic and prevent privilege escalation via role manipulation.
+    """
+
+    async def test_admin_role_does_not_bypass_permission_check(self) -> None:
+        """User with 'admin' role but no permissions does NOT bypass the check.
+
+        The base class check_permission checks only user.permissions.
+        Role-based overrides should be handled at the request level, not here.
+        """
         provider = _make_provider()
         tenant_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
         admin_user = AuthUser(
@@ -262,9 +338,8 @@ class TestKeycloakCheckPermission:
             permissions=(),  # no explicit permissions
             name="Admin User",
         )
-        # Admin bypass: must return True for any arbitrary permission
-        assert await provider.check_permission(admin_user, "any:permission") is True
-        assert await provider.check_permission(admin_user, "superuser:delete") is True
+        # Base class: no admin bypass — returns False when permission is missing
+        assert await provider.check_permission(admin_user, "any:permission") is False
 
     async def test_non_admin_user_with_matching_permission_returns_true(self) -> None:
         """Non-admin user with the permission in their permissions tuple returns True."""

@@ -59,6 +59,9 @@ class SautiRISSettings(BaseSettings):
     dicom_ae_whitelist: list[str] | None = None  # None = allow all
     dicom_max_connections_per_ip: int = 10
     dicom_ip_rate_limit_per_minute: int = 60
+    # #21: dicom_tls_enabled gates build_dicom_ssl_context() in dicom/security.py.
+    # When True, dicom_tls_ca_cert/cert/key must also be set.  Call
+    # build_dicom_ssl_context(settings) at server startup to apply TLS.
     dicom_tls_enabled: bool = False
     dicom_tls_ca_cert: str = ""
     dicom_tls_cert: str = ""
@@ -98,7 +101,15 @@ class SautiRISSettings(BaseSettings):
     cors_origins: list[str] = []
     cors_allow_credentials: bool = False
     cors_allow_methods: list[str] = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
-    cors_allow_headers: list[str] = ["Authorization", "Content-Type", "X-Request-ID"]
+    # #3: X-Tenant-ID, X-API-Key, and X-Correlation-ID are used in deps/middleware
+    cors_allow_headers: list[str] = [
+        "Authorization",
+        "Content-Type",
+        "X-Request-ID",
+        "X-Tenant-ID",
+        "X-API-Key",
+        "X-Correlation-ID",
+    ]
 
     # --- Encryption (issue #6) ---
     # Set to a Fernet key: Fernet.generate_key().decode()
@@ -112,6 +123,14 @@ class SautiRISSettings(BaseSettings):
     rate_limit_auth_endpoints: str = "10/minute"
     rate_limit_apikey_create: str = "5/minute"
     rate_limit_trusted_ips: list[str] = []
+
+    # --- Audit (Issue #22, #65) ---
+    # audit_log_reads: whether READ (GET) operations are written to the audit log.
+    # Disable only in high-throughput environments where read-audit is not required.
+    audit_log_reads: bool = True
+    # audit_log_retention_days: how long audit records are kept (for purge jobs).
+    # Default 365 days satisfies most HIPAA retention requirements.
+    audit_log_retention_days: int = 365
 
     # --- Tenant ---
     default_tenant_id: str = "00000000-0000-0000-0000-000000000001"
@@ -136,4 +155,9 @@ class SautiRISSettings(BaseSettings):
                 "SAUTIRIS_ENCRYPTION_KEY must be set in production. "
                 'Generate one with: python -c "from cryptography.fernet import Fernet; '
                 'print(Fernet.generate_key().decode())"'
+            )
+        if self.dicom_tls_enabled and (not self.dicom_tls_cert or not self.dicom_tls_key):
+            raise ConfigurationError(
+                "dicom_tls_enabled=True requires both dicom_tls_cert and dicom_tls_key "
+                "to be set. Provide paths to the TLS certificate and private key files."
             )

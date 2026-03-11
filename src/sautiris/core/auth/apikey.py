@@ -36,13 +36,13 @@ class APIKeyAuthProvider(AuthProvider):
         if not raw_key:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=f"Missing {self.header_name} header",
+                detail="Missing or invalid API key",
             )
 
         if self._session_factory is None:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="API key auth not configured",
+                detail="Authentication service unavailable",
             )
 
         async with self._session_factory() as session:

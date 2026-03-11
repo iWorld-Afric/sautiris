@@ -45,8 +45,21 @@ class TestIsPhiRoute:
     def test_health_not_phi(self) -> None:
         assert _is_phi_route("/api/v1/health") is False
 
-    def test_alerts_not_phi(self) -> None:
-        assert _is_phi_route("/api/v1/alerts") is False
+    # SEC-4: New PHI route prefixes
+    def test_alerts_is_phi(self) -> None:
+        assert _is_phi_route("/api/v1/alerts") is True
+
+    def test_dose_is_phi(self) -> None:
+        assert _is_phi_route("/api/v1/dose") is True
+
+    def test_billing_is_phi(self) -> None:
+        assert _is_phi_route("/api/v1/billing") is True
+
+    def test_peer_review_is_phi(self) -> None:
+        assert _is_phi_route("/api/v1/peer-review") is True
+
+    def test_peer_review_with_id_is_phi(self) -> None:
+        assert _is_phi_route("/api/v1/peer-review/abc-123") is True
 
     def test_root_not_phi(self) -> None:
         assert _is_phi_route("/") is False
@@ -427,8 +440,8 @@ class TestLogPhiAccessOperationalError:
         event_key = call_args[0][0] if call_args[0] else ""
         assert event_key == "audit_middleware.database_unreachable"
 
-    async def test_generic_exception_logs_error_not_critical(self) -> None:
-        """A non-OperationalError exception is caught by the generic except and logs ERROR."""
+    async def test_generic_exception_logs_critical(self) -> None:
+        """A non-OperationalError exception is caught by the generic except and logs CRITICAL."""
         request = self._make_request_with_user()
         response = MagicMock()
         response.status_code = 200
@@ -442,9 +455,12 @@ class TestLogPhiAccessOperationalError:
         ):
             await _log_phi_access(request, response, "test-generic-cid")
 
-        # Generic exception → logger.error (not logger.critical)
-        mock_logger.error.assert_called_once()
-        call_args = mock_logger.error.call_args
-        event_key = call_args[0][0] if call_args[0] else ""
-        assert event_key == "audit_middleware.log_failed"
-        mock_logger.critical.assert_not_called()
+        # M5: Generic exception now logs CRITICAL (audit failures are critical)
+        mock_logger.critical.assert_called()
+        # Find the call with the generic log_failed event key
+        log_failed_calls = [
+            c
+            for c in mock_logger.critical.call_args_list
+            if c[0] and c[0][0] == "audit_middleware.log_failed"
+        ]
+        assert len(log_failed_calls) == 1

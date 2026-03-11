@@ -370,9 +370,8 @@ async def test_event_publish_errors_are_logged(
     report_obj.report_status = ReportStatus.PRELIMINARY
     await service.report_repo.update(report_obj)
 
-    # finalize_report calls _emit("report.finalized") → _publish → handler fails
-    # _publish should log the error but NOT re-raise (non-critical handler)
-    with patch("sautiris.services.report_service.logger") as mock_logger:
+    # finalize_report → _publish (in mixin) → handler fails → mixin logger.error
+    with patch("sautiris.services.mixins.logger") as mock_logger:
         await service.finalize_report(
             report.id,
             approved_by=TEST_USER_ID,
@@ -421,7 +420,8 @@ async def test_critical_finding_handler_failure_logged_at_critical_level(
     report_obj.report_status = ReportStatus.PRELIMINARY
     await service.report_repo.update(report_obj)
 
-    with patch("sautiris.services.report_service.logger") as mock_logger:
+    # _publish is in the mixin; patch mixins.logger for critical event logging
+    with patch("sautiris.services.mixins.logger") as mock_logger:
         await service.finalize_report(
             report.id,
             approved_by=TEST_USER_ID,
@@ -429,10 +429,10 @@ async def test_critical_finding_handler_failure_logged_at_critical_level(
         )
         # logger.critical must be called when CriticalFinding handler fails
         mock_logger.critical.assert_called()
-        # The critical call must mention the patient-safety aspect
+        # The critical call must mention the critical event handler failure
         call_args = mock_logger.critical.call_args
         event_name = call_args[0][0] if call_args[0] else str(call_args)
-        assert "critical" in event_name.lower() or "critical_finding" in event_name.lower()
+        assert "critical_event_handlers_failed" in event_name
 
 
 # ---------------------------------------------------------------------------

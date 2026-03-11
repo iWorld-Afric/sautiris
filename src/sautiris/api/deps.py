@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncGenerator, Callable, Coroutine
-from typing import Any, cast
+from typing import Any
 
 import structlog
 from fastapi import Depends, HTTPException, Request
@@ -43,6 +43,36 @@ async def get_current_user(request: Request) -> AuthUser:
     user = await auth_provider.get_current_user(request)
     # Issue #1: ContextVar is set from JWT only — never from request header
     set_current_tenant_id(user.tenant_id)
+
+    # SEC-1: Reject X-Tenant-ID header when it doesn't match the JWT tenant.
+    # A mismatch signals either an attack (tenant spoofing) or misconfiguration.
+    header_tenant = request.headers.get("X-Tenant-ID")
+    if header_tenant is not None:
+        # #1: Compare UUID objects to avoid case-sensitive string mismatch
+        try:
+            header_uuid = uuid.UUID(header_tenant)
+        except ValueError:
+            logger.warning(
+                "auth.invalid_tenant_id_header",
+                header_tenant_id=header_tenant,
+                user_id=str(user.user_id),
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="X-Tenant-ID header does not match authenticated tenant",
+            ) from None
+        if header_uuid != user.tenant_id:
+            logger.warning(
+                "auth.tenant_id_mismatch",
+                header_tenant_id=header_tenant,
+                jwt_tenant_id=str(user.tenant_id),
+                user_id=str(user.user_id),
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="X-Tenant-ID header does not match authenticated tenant",
+            )
+
     # FIX-2: Write user to request.state so AuditMiddleware can read it
     request.state.user = user
     return user
@@ -60,7 +90,13 @@ async def get_tenant_id(user: AuthUser = Depends(get_current_user)) -> uuid.UUID
 
 async def get_event_bus(request: Request) -> EventBus:
     """Return the per-app EventBus instance stored on app.state."""
-    return cast(EventBus, request.app.state.event_bus)
+    # #48: Guard against None before returning — raises 500 with a clear message
+    bus = getattr(request.app.state, "event_bus", None)
+    if bus is None:
+        raise HTTPException(status_code=500, detail="Event bus not configured")
+    if not isinstance(bus, EventBus):
+        raise HTTPException(status_code=500, detail="Event bus not configured")
+    return bus
 
 
 def require_permission(permission: str) -> Callable[..., Coroutine[Any, Any, AuthUser]]:
@@ -68,10 +104,21 @@ def require_permission(permission: str) -> Callable[..., Coroutine[Any, Any, Aut
     from sautiris.core.permissions import Permission, has_permission  # noqa: PLC0415
 
     async def _check(user: AuthUser = Depends(get_current_user)) -> AuthUser:
-        if not has_permission(user.roles, Permission(permission)):
+        # SEC-3: Check both role-based AND explicit permissions.
+        # API key users have permissions populated directly (not via roles),
+        # so the roles-only check would always reject them.
+        # #2: Wrap Permission() in try/except to handle invalid enum values gracefully
+        try:
+            perm_enum = Permission(permission)
+        except ValueError:
             raise HTTPException(
                 status_code=403,
-                detail=f"Missing permission: {permission}",
+                detail="Insufficient permissions",
+            ) from None
+        if not has_permission(user.roles, perm_enum) and permission not in user.permissions:
+            raise HTTPException(
+                status_code=403,
+                detail="Insufficient permissions",
             )
         return user
 

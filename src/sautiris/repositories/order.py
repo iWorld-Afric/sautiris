@@ -6,7 +6,7 @@ import uuid
 from collections.abc import Sequence
 from datetime import date
 
-from sqlalchemy import String, cast, func, select
+from sqlalchemy import func, select
 
 from sautiris.models.order import OrderStatus, RadiologyOrder, Urgency
 from sautiris.repositories.base import TenantAwareRepository
@@ -14,22 +14,6 @@ from sautiris.repositories.base import TenantAwareRepository
 
 class OrderRepository(TenantAwareRepository[RadiologyOrder]):
     model = RadiologyOrder
-
-    async def get_next_accession_number(self, modality: str, date_prefix: str) -> str:
-        """Generate next accession number: {YYYYMMDD}-{MODALITY}-{SEQ:05d}."""
-        prefix = f"{date_prefix}-{modality}-"
-        stmt = (
-            select(func.count())
-            .select_from(RadiologyOrder)
-            .where(
-                RadiologyOrder.tenant_id == self._tenant_id,
-                cast(RadiologyOrder.accession_number, String).like(f"{prefix}%"),
-            )
-        )
-        result = await self.session.execute(stmt)
-        count = result.scalar_one()
-        seq = count + 1
-        return f"{prefix}{seq:05d}"
 
     async def list_with_filters(
         self,

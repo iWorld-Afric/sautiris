@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from typing import ClassVar
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +13,7 @@ from sautiris.core.events import DomainEvent, DRLExceeded, EventBus
 from sautiris.core.tenancy import get_current_tenant_id
 from sautiris.models.dose import DoseRecord, DoseSource
 from sautiris.repositories.dose import DoseRepository
+from sautiris.services.mixins import EventPublisherMixin
 
 logger = structlog.get_logger(__name__)
 
@@ -42,8 +44,10 @@ DEFAULT_DRL: dict[str, dict[str, dict[str, float]]] = {
 }
 
 
-class DoseService:
+class DoseService(EventPublisherMixin):
     """Service for radiation dose tracking and DRL compliance."""
+
+    _critical_event_types: ClassVar[tuple[type[DomainEvent], ...]] = (DRLExceeded,)
 
     def __init__(
         self,
@@ -56,28 +60,6 @@ class DoseService:
         self.repo = DoseRepository(session)
         self.drl = drl_reference or DEFAULT_DRL
         self._event_bus = event_bus
-
-    async def _publish(self, event: DomainEvent) -> None:
-        """Publish a domain event if an event bus is configured."""
-        if self._event_bus is not None:
-            errors = await self._event_bus.publish(event)
-            if errors:
-                for exc in errors:
-                    logger.error(
-                        "event_bus.handler_error",
-                        event_type=event.event_type,
-                        error=str(exc),
-                    )
-                if isinstance(event, DRLExceeded):
-                    logger.critical(
-                        "event_bus.drl_exceeded_handlers_failed",
-                        event_type=event.event_type,
-                        error_count=len(errors),
-                        msg=(
-                            "DRLExceeded handlers failed — patient safety event "
-                            "may not have been delivered"
-                        ),
-                    )
 
     async def record_dose(
         self,

@@ -128,7 +128,9 @@ class TestOAuth2JwtErrors:
             await provider.authenticate(request)
 
         assert exc_info.value.status_code == 401
-        assert "tenant_id" in exc_info.value.detail.lower()
+        # #9: Generic user-facing message hides internal details;
+        # server-side logging (auth.invalid_token) contains the reason.
+        assert exc_info.value.detail == "Invalid or expired token"
 
 
 class TestOAuth2ValidJwt:
@@ -212,6 +214,69 @@ class TestOAuth2JwksFetchFailure:
 # ---------------------------------------------------------------------------
 # GAP-I2: check_permission — OAuth2 has NO admin bypass (contrast with Keycloak)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# #53: UUID validation — non-UUID sub and tenant_id must return 401
+# ---------------------------------------------------------------------------
+
+
+class TestOAuth2UUIDValidation:
+    """#53: Non-UUID or missing sub/tenant_id claims must return 401.
+
+    OAuth2AuthProvider uses the same _parse_uuid helper from JWKSAuthProviderBase,
+    so these tests verify the shared behaviour is wired correctly.
+    """
+
+    async def test_non_uuid_sub_returns_401(self) -> None:
+        """sub claim that is not a valid UUID → 401 (not a server error)."""
+        provider = _make_provider()
+        _prime_jwks_cache(provider)
+        payload = _make_valid_payload(sub="not-a-valid-uuid-string")
+        request = _make_request(authorization="Bearer bad-sub-token")
+
+        with (
+            patch("sautiris.core.auth.oauth2.jwt.decode", return_value=payload),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await provider.authenticate(request)
+
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.detail == "Invalid or expired token"
+
+    async def test_missing_sub_claim_returns_401(self) -> None:
+        """Token with no 'sub' field → 401."""
+        provider = _make_provider()
+        _prime_jwks_cache(provider)
+        payload = _make_valid_payload()
+        del payload["sub"]
+        request = _make_request(authorization="Bearer no-sub-token")
+
+        with (
+            patch("sautiris.core.auth.oauth2.jwt.decode", return_value=payload),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await provider.authenticate(request)
+
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.detail == "Invalid or expired token"
+
+    async def test_non_uuid_tenant_id_returns_401(self) -> None:
+        """tenant_id claim that is not a valid UUID → 401."""
+        provider = _make_provider()
+        _prime_jwks_cache(provider)
+        payload = _make_valid_payload()
+        payload["tenant_id"] = "totally-not-a-uuid"
+        request = _make_request(authorization="Bearer bad-tenant-token")
+
+        with (
+            patch("sautiris.core.auth.oauth2.jwt.decode", return_value=payload),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await provider.authenticate(request)
+
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.detail == "Invalid or expired token"
 
 
 class TestOAuth2CheckPermission:

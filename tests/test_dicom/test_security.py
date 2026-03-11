@@ -193,7 +193,7 @@ class TestHandleAssociationRequest:
         sec = DicomAssociationSecurity(ae_whitelist=["ALLOWED_AE"])
         event = _make_event(ae_title="UNKNOWN_AE", ip="10.0.0.1")
 
-        with pytest.raises(RuntimeError, match="whitelist"):
+        with pytest.raises(RuntimeError, match="Association rejected"):
             sec.handle_association_request(event)  # type: ignore[arg-type]
 
     def test_handle_association_request_rate_limited(self) -> None:
@@ -207,7 +207,7 @@ class TestHandleAssociationRequest:
         sec.release_connection("10.0.0.1")
 
         # 3rd request exceeds rate limit
-        with pytest.raises(RuntimeError, match="[Rr]ate limit"):
+        with pytest.raises(RuntimeError, match="Association rejected"):
             sec.handle_association_request(event)  # type: ignore[arg-type]
 
     def test_handle_association_request_connection_limited(self) -> None:
@@ -219,7 +219,7 @@ class TestHandleAssociationRequest:
         sec.acquire_connection("10.0.0.2")
 
         # Now the handler sees the connection limit exceeded
-        with pytest.raises(RuntimeError, match="[Cc]onnection limit"):
+        with pytest.raises(RuntimeError, match="Association rejected"):
             sec.handle_association_request(event)  # type: ignore[arg-type]
 
     def test_handle_association_request_extraction_failure_rejects(self) -> None:

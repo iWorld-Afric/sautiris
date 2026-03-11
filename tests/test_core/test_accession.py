@@ -75,6 +75,50 @@ async def test_concurrent_accession_unique(db_session: AsyncSession) -> None:
 
 
 @pytest.mark.asyncio
+async def test_accession_number_resets_on_date_rollover(db_session: AsyncSession) -> None:
+    """#62: Accession counter resets to 00001 for a new date.
+
+    The counter key includes the date component, so when midnight rolls over
+    (a different date), the counter for the new date starts at 1, independent
+    of however many numbers were generated on the previous date.
+    """
+    from datetime import date
+    from unittest.mock import patch
+
+    from sautiris.core.accession import generate_accession_number
+
+    tenant_id = uuid.UUID("00000000-0000-0000-0000-000000000099")
+    prefix = "ROLLOVER"
+
+    day_1 = date(2026, 3, 10)
+    day_2 = date(2026, 3, 11)
+
+    # Generate 3 accessions on day 1
+    with patch("sautiris.core.accession.date") as mock_date:
+        mock_date.today.return_value = day_1
+        acc_d1_1 = await generate_accession_number(db_session, tenant_id, prefix)
+        acc_d1_2 = await generate_accession_number(db_session, tenant_id, prefix)
+        acc_d1_3 = await generate_accession_number(db_session, tenant_id, prefix)
+
+    seq_d1 = [int(a.rsplit("-", 1)[-1]) for a in [acc_d1_1, acc_d1_2, acc_d1_3]]
+    assert seq_d1 == [1, 2, 3], f"Day 1 sequences should be 1,2,3 — got {seq_d1}"
+
+    # Roll over to day 2 — counter must reset to 1
+    with patch("sautiris.core.accession.date") as mock_date:
+        mock_date.today.return_value = day_2
+        acc_d2_1 = await generate_accession_number(db_session, tenant_id, prefix)
+        acc_d2_2 = await generate_accession_number(db_session, tenant_id, prefix)
+
+    seq_d2 = [int(a.rsplit("-", 1)[-1]) for a in [acc_d2_1, acc_d2_2]]
+    assert seq_d2 == [1, 2], f"After date rollover, counter must reset to 1 — got {seq_d2}"
+
+    # Verify the date component in the accession number matches the mocked date
+    assert acc_d2_1.startswith(f"{prefix}-20260311-"), (
+        f"Accession on day 2 should have date 20260311: {acc_d2_1}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_peek_next_accession_number_readonly(db_session: AsyncSession) -> None:
     """peek_next_accession_number must NOT increment the counter.
 

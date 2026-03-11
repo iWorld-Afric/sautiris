@@ -74,6 +74,29 @@ class TestRateLimitMiddleware:
                 resp = await client.get("/health")
                 assert resp.status_code == 200
 
+    async def test_root_path_exempt(self) -> None:
+        """Root path '/' is exempt from rate limiting (GAP-6: load balancer probe)."""
+        app = FastAPI()
+        settings = SautiRISSettings(
+            rate_limit_enabled=True,
+            rate_limit_general="1/minute",
+            rate_limit_auth_endpoints="1/minute",
+            rate_limit_apikey_create="1/minute",
+            rate_limit_trusted_ips=[],
+            database_url="sqlite+aiosqlite:///:memory:",
+        )
+        app.add_middleware(RateLimitMiddleware, settings=settings)
+
+        @app.get("/")
+        async def root() -> JSONResponse:
+            return JSONResponse({"status": "ok"})
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            for _ in range(10):
+                resp = await client.get("/")
+                assert resp.status_code == 200
+
     async def test_disabled_rate_limiting(self) -> None:
         app = _make_limited_app(general_rate="1/minute", enabled=False)
         transport = ASGITransport(app=app)
@@ -232,7 +255,9 @@ class TestEvictStaleKeys:
             mw._windows[f"k{i}"] = []
         assert len(mw._windows) > _MAX_WINDOW_KEYS
 
-        mw._evict_stale_keys()
+        import time
+
+        mw._evict_stale_keys(time.monotonic())
 
         assert len(mw._windows) == 0
 
@@ -247,7 +272,7 @@ class TestEvictStaleKeys:
         mw._windows["active-1"] = [now]
         mw._windows["active-2"] = [now, now - 1]
 
-        mw._evict_stale_keys()
+        mw._evict_stale_keys(now)
 
         assert "active-1" in mw._windows
         assert "active-2" in mw._windows
@@ -256,13 +281,15 @@ class TestEvictStaleKeys:
 
     def test_no_eviction_below_threshold(self) -> None:
         """GAP-M3c: _evict_stale_keys is a no-op when len ≤ _MAX_WINDOW_KEYS."""
+        import time
+
         mw = self._make_mw()
         # Add a handful of empty buckets (well below threshold)
         for i in range(10):
             mw._windows[f"k{i}"] = []
         initial_count = len(mw._windows)
 
-        mw._evict_stale_keys()
+        mw._evict_stale_keys(time.monotonic())
 
         # No change — below threshold
         assert len(mw._windows) == initial_count

@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sautiris.core.events import CriticalFinding, EventBus
 from sautiris.models.alert import AlertType, AlertUrgency, CriticalAlert, NotificationMethod
 from sautiris.services.alert_service import AlertService
 from tests.conftest import TEST_USER_ID, make_order
@@ -228,7 +229,12 @@ class TestAlertServiceDispatchFailures:
     async def test_escalate_alert_dispatch_failure_logged(
         self, db_session: AsyncSession, order: object
     ) -> None:
-        """Escalation dispatch errors are logged as CRITICAL; escalated flag is still set."""
+        """Escalation dispatch errors are logged as CRITICAL.
+
+        Per #43: when dispatch fails, the alert is NOT marked escalated=True;
+        instead notification_failed=True is set so the auto-escalation worker
+        can retry.  The alert is still returned.
+        """
         from unittest.mock import patch
 
         class _FailingDispatcher:
@@ -242,17 +248,24 @@ class TestAlertServiceDispatchFailures:
         )
 
         with patch("sautiris.services.alert_service.logger") as mock_logger:
-            escalated = await svc.escalate_alert(alert.id)
+            result = await svc.escalate_alert(alert.id)
             mock_logger.critical.assert_called()
             event_key = mock_logger.critical.call_args[0][0]
             assert "dispatch_failed" in event_key
 
-        assert escalated.escalated is True
+        # Per #43: dispatch failure means NOT escalated, but notification_failed is set
+        assert result.escalated is False
+        assert result.notification_failed is True
 
     async def test_check_escalation_dispatch_failure_logged(
         self, db_session: AsyncSession, order: object
     ) -> None:
-        """Batch escalation dispatch errors per stale alert are logged as CRITICAL."""
+        """Batch escalation dispatch errors are logged as CRITICAL.
+
+        Per #43: alerts whose notification failed during check_escalation are NOT
+        added to the returned list (they were not successfully escalated), but
+        logger.critical is still called and notification_failed is set on the alert.
+        """
         from unittest.mock import patch
 
         class _FailingDispatcher:
@@ -276,7 +289,8 @@ class TestAlertServiceDispatchFailures:
             escalated_list = await svc.check_escalation()
             mock_logger.critical.assert_called()
 
-        assert len(escalated_list) == 1
+        # Per #43: dispatch failure means NOT in escalated list, but notification_failed set
+        assert len(escalated_list) == 0
 
     async def test_create_alert_commit_failure_propagates(
         self, db_session: AsyncSession, order: object
@@ -293,3 +307,252 @@ class TestAlertServiceDispatchFailures:
                     order_id=order.id,  # type: ignore[union-attr]
                     alert_type=AlertType.CRITICAL_FINDING,
                 )
+
+
+# ---------------------------------------------------------------------------
+# EventBus integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestAlertServiceEventBus:
+    """CriticalFinding event emission via EventBus."""
+
+    async def test_critical_finding_event_emitted(
+        self, db_session: AsyncSession, order: object
+    ) -> None:
+        """CriticalFinding event is published when alert_type is CRITICAL_FINDING."""
+        bus = EventBus()
+        received: list[CriticalFinding] = []
+
+        async def handler(event: CriticalFinding) -> None:  # type: ignore[type-arg]
+            received.append(event)
+
+        bus.subscribe("finding.critical", handler)
+
+        svc = AlertService(db_session, event_bus=bus)
+        alert = await svc.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.CRITICAL_FINDING,
+            finding_description="Pneumothorax detected",
+            urgency=AlertUrgency.IMMEDIATE,
+        )
+
+        assert len(received) == 1
+        evt = received[0]
+        assert evt.event_type == "finding.critical"
+        assert evt.order_id == str(order.id)  # type: ignore[union-attr]
+        assert evt.alert_id == str(alert.id)
+        assert evt.finding_description == "Pneumothorax detected"
+        assert evt.urgency == "IMMEDIATE"
+
+    async def test_no_event_for_non_critical_alert(
+        self, db_session: AsyncSession, order: object
+    ) -> None:
+        """No CriticalFinding event for non-CRITICAL_FINDING alert types."""
+        bus = EventBus()
+        received: list[CriticalFinding] = []
+
+        async def handler(event: CriticalFinding) -> None:  # type: ignore[type-arg]
+            received.append(event)
+
+        bus.subscribe("finding.critical", handler)
+
+        svc = AlertService(db_session, event_bus=bus)
+        await svc.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.INCIDENTAL,
+            finding_description="Benign cyst noted",
+            urgency=AlertUrgency.NON_URGENT,
+        )
+
+        assert len(received) == 0
+
+    async def test_no_event_for_unexpected_finding(
+        self, db_session: AsyncSession, order: object
+    ) -> None:
+        """No CriticalFinding event for UNEXPECTED_FINDING alert type."""
+        bus = EventBus()
+        received: list[CriticalFinding] = []
+
+        async def handler(event: CriticalFinding) -> None:  # type: ignore[type-arg]
+            received.append(event)
+
+        bus.subscribe("finding.critical", handler)
+
+        svc = AlertService(db_session, event_bus=bus)
+        await svc.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.UNEXPECTED_FINDING,
+        )
+
+        assert len(received) == 0
+
+    async def test_event_bus_handler_error_does_not_break_alert(
+        self, db_session: AsyncSession, order: object
+    ) -> None:
+        """If an event handler raises, the alert is still created successfully."""
+        bus = EventBus()
+
+        async def failing_handler(event: CriticalFinding) -> None:  # type: ignore[type-arg]
+            raise RuntimeError("handler crashed")
+
+        bus.subscribe("finding.critical", failing_handler)
+
+        svc = AlertService(db_session, event_bus=bus)
+        alert = await svc.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.CRITICAL_FINDING,
+            finding_description="Tension pneumothorax",
+        )
+        # Alert still persisted despite handler failure
+        assert alert.id is not None
+
+    async def test_no_event_bus_still_works(self, db_session: AsyncSession, order: object) -> None:
+        """AlertService without event_bus works as before (backward compat)."""
+        svc = AlertService(db_session)
+        alert = await svc.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.CRITICAL_FINDING,
+        )
+        assert alert.id is not None
+
+
+# ---------------------------------------------------------------------------
+# check_escalation commit failure — returns [] on failure
+# ---------------------------------------------------------------------------
+
+
+class TestCheckEscalationCommitFailure:
+    async def test_check_escalation_returns_empty_on_commit_failure(
+        self, db_session: AsyncSession, order: object
+    ) -> None:
+        """check_escalation returns [] when session.commit() fails.
+
+        The escalated records were not persisted, so returning them would
+        mislead the caller into thinking they were saved.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        svc = AlertService(db_session, escalation_timeout_minutes=30)
+        alert = await svc.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.CRITICAL_FINDING,
+        )
+        # Backdate to exceed the 30-minute escalation timeout
+        alert.created_at = datetime.now(UTC) - timedelta(minutes=60)  # type: ignore[assignment]
+        await db_session.flush()
+
+        with patch.object(db_session, "commit", new_callable=AsyncMock) as mock_commit:
+            mock_commit.side_effect = RuntimeError("DB went away")
+            escalated = await svc.check_escalation()
+
+        # Must return empty list since commit failed — records not persisted
+        assert escalated == []
+
+
+class TestCheckEscalationNotificationFailedPersisted:
+    """M14: verify notification_failed flag is persisted even when dispatch fails."""
+
+    async def test_notification_failed_persisted_after_escalation(
+        self, db_session: AsyncSession, order: object
+    ) -> None:
+        """When escalation dispatch fails, notification_failed is still committed."""
+
+        class _FailingDispatcher:
+            async def dispatch(self, **kwargs: object) -> None:
+                raise RuntimeError("notification service down")
+
+        svc = AlertService(
+            db_session,
+            notification_dispatcher=_FailingDispatcher(),
+            escalation_timeout_minutes=30,
+        )
+        alert = await svc.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.CRITICAL_FINDING,
+        )
+        # Backdate to exceed escalation timeout
+        alert.created_at = datetime.now(UTC) - timedelta(minutes=60)  # type: ignore[assignment]
+        await db_session.flush()
+
+        # Run escalation — dispatch will fail
+        escalated = await svc.check_escalation()
+        assert len(escalated) == 0  # not successfully escalated
+
+        # Refresh the alert from DB to verify notification_failed was persisted
+        await db_session.refresh(alert)
+        assert alert.notification_failed is True
+        assert alert.notification_error is not None
+        assert "notification service down" in alert.notification_error
+
+
+class TestCheckEscalationClearOnSuccess:
+    """R5-H2: verify check_escalation clears notification_failed on re-dispatch success."""
+
+    async def test_notification_failed_cleared_on_successful_redispatch(
+        self, db_session: AsyncSession, order: object
+    ) -> None:
+        """Alerts with notification_failed=True get cleared after successful re-dispatch."""
+
+        call_count = 0
+
+        class _FailOnceThenSucceed:
+            async def dispatch(self, **kwargs: object) -> None:
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    raise RuntimeError("first dispatch fails")
+                # subsequent calls succeed
+
+        dispatcher = _FailOnceThenSucceed()
+        svc = AlertService(
+            db_session,
+            notification_dispatcher=dispatcher,
+            escalation_timeout_minutes=0,  # escalate immediately
+        )
+        alert = await svc.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.CRITICAL_FINDING,
+            finding_description="Test finding",
+        )
+        await db_session.refresh(alert)
+        assert alert.notification_failed is True
+
+        # Backdate so it's eligible for escalation
+        alert.created_at = datetime.now(UTC) - timedelta(minutes=5)  # type: ignore[assignment]
+        await db_session.flush()
+
+        # Second dispatch will succeed — should clear notification_failed
+        escalated = await svc.check_escalation()
+        assert len(escalated) == 1
+        await db_session.refresh(escalated[0])
+        assert escalated[0].notification_failed is False
+        assert escalated[0].notification_error is None
+
+
+class TestCreateAlertNotificationFailedTracked:
+    """H2: verify create_alert() tracks notification failure."""
+
+    async def test_create_alert_notification_failure_sets_flags(
+        self, db_session: AsyncSession, order: object
+    ) -> None:
+        """When notification dispatch fails during create, notification_failed is set."""
+
+        class _FailingDispatcher:
+            async def dispatch(self, **kwargs: object) -> None:
+                raise RuntimeError("cannot reach notification service")
+
+        svc = AlertService(
+            db_session,
+            notification_dispatcher=_FailingDispatcher(),
+        )
+        alert = await svc.create_alert(
+            order_id=order.id,  # type: ignore[union-attr]
+            alert_type=AlertType.CRITICAL_FINDING,
+            finding_description="Test finding",
+        )
+
+        await db_session.refresh(alert)
+        assert alert.notification_failed is True
+        assert alert.notification_error is not None
+        assert "cannot reach notification service" in alert.notification_error
